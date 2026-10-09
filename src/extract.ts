@@ -210,6 +210,14 @@ export function classifyByBytes(b: Buffer, byName: Kind): Kind {
     (b.length >= 6 && b.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])))
   )
     return "archive-other";
+  // Text files are often saved with the wrong extension (a HAR as .txt, JSON as .log).
+  if (["text", "json", "xml", "unknown"].includes(byName) && !looksBinary(b)) {
+    const head = decodeText(b.subarray(0, 4096)).trimStart();
+    if (head.startsWith("{") && /"log"\s*:\s*\{/.test(head) && /"(entries|creator)"\s*:/.test(head))
+      return "har";
+    if (byName !== "xml" && (head.startsWith("{") || head.startsWith("["))) return "json";
+    if (byName !== "json" && head.startsWith("<?xml")) return "xml";
+  }
   if (byName === "unknown") return looksBinary(b) ? "unknown" : "text";
   return byName;
 }
@@ -659,39 +667,46 @@ const extractPdf: Extractor = async (b, _name, budget) => {
 
 const extractDocx: Extractor = async (b, _name, budget) => {
   const mammoth = (await import("mammoth")).default;
-  const imageCount = { n: 0 };
+  // Images are captured in document order, so placeholder N always matches image N.
+  const embedded: Buffer[] = [];
   // biome-ignore lint/suspicious/noExplicitAny: convertToMarkdown exists at runtime but is missing from the type definitions.
   const result = await (mammoth as any).convertToMarkdown(
     { buffer: b },
     {
-      convertImage: mammoth.images.imgElement(async () => {
-        imageCount.n++;
-        return { src: `embedded-image-${imageCount.n}` };
+      convertImage: mammoth.images.imgElement(async (image) => {
+        embedded.push(Buffer.from(await image.read()));
+        return { src: `embedded-image-${embedded.length}` };
       }),
     },
   );
-  const notes = imageCount.n ? [`${imageCount.n} embedded image(s) shown as placeholders`] : [];
+  const notes: string[] = [];
   const images: Content[] = [];
-  // Return the embedded images themselves, within budget.
-  if (imageCount.n) {
-    const { unzipSync } = await import("fflate");
-    const files = unzipSync(new Uint8Array(b), { filter: (f) => f.name.startsWith("word/media/") });
-    for (const [path, data] of Object.entries(files)) {
-      if (!budget.takeImage()) {
-        notes.push("more embedded images skipped: max_images reached");
-        break;
-      }
-      const img = await toSupportedImage(Buffer.from(data));
-      if (!img) continue;
-      images.push(textBlock(`Embedded image ${path.split("/").pop()}`), {
-        type: "image",
-        data: img.data.toString("base64"),
-        mimeType: img.mimeType,
-      });
+  for (let i = 0; i < embedded.length; i++) {
+    if (!budget.takeImage()) {
+      notes.push(`embedded images ${i + 1} to ${embedded.length} skipped: max_images reached`);
+      break;
     }
+    const img = await toSupportedImage(embedded[i]);
+    if (!img) {
+      notes.push(`embedded image ${i + 1} could not be decoded`);
+      continue;
+    }
+    images.push(textBlock(`embedded-image-${i + 1}`), {
+      type: "image",
+      data: img.data.toString("base64"),
+      mimeType: img.mimeType,
+    });
   }
-  // Mammoth escapes Markdown punctuation everywhere (ABC\-123\.), which only adds noise here.
-  const markdown = String(result.value ?? "").replace(/\\([\\`*_{}[\]()#+\-.!|<>])/g, "$1");
+  const markdown = String(result.value ?? "")
+    // Mammoth escapes Markdown punctuation everywhere (ABC\-123\.), which only adds noise here.
+    .replace(/\\([\\`*_{}[\]()#+\-.!|<>])/g, "$1")
+    // Markdown hard line breaks ("  \n") and runs of blank lines.
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n");
+  if (embedded.length)
+    notes.unshift(
+      `${embedded.length} embedded image(s), returned after the text as embedded-image-N`,
+    );
   return {
     kind: "docx",
     content: [textBlock(budget.takeText(markdown.trim() || "(no text)")), ...images],
