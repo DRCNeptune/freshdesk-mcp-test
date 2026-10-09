@@ -32,6 +32,7 @@ export type Kind =
   | "executable"
   | "legacy-office"
   | "archive-other"
+  | "image-unsupported"
   | "unknown";
 
 const EXT_KIND: Record<string, Kind> = {
@@ -63,6 +64,14 @@ const EXT_KIND: Record<string, Kind> = {
   doc: "legacy-office",
   xls: "legacy-office",
   ppt: "legacy-office",
+  avif: "image-unsupported",
+  ico: "image-unsupported",
+  psd: "image-unsupported",
+  eps: "image-unsupported",
+  cr2: "image-unsupported",
+  nef: "image-unsupported",
+  arw: "image-unsupported",
+  dng: "image-unsupported",
   rar: "archive-other",
   "7z": "archive-other",
   gz: "archive-other",
@@ -142,6 +151,70 @@ export function classifyByName(name: string, contentType: string): Kind {
   return "unknown";
 }
 
+/* -------------------------------------------------------------------------- */
+/* Type filter (FRESHDESK_ATTACHMENT_TYPES)                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Names accepted in FRESHDESK_ATTACHMENT_TYPES and the kinds each one enables. */
+export const ATTACHMENT_TYPES: Record<string, Kind[]> = {
+  image: ["image", "image-convert"],
+  pdf: ["pdf"],
+  docx: ["docx"],
+  xlsx: ["xlsx"],
+  csv: ["csv"],
+  pptx: ["pptx"],
+  zip: ["zip"],
+  eml: ["eml"],
+  msg: ["msg"],
+  har: ["har"],
+  json: ["json"],
+  xml: ["xml"],
+  text: ["text"],
+};
+
+function parseEnabledKinds(): Set<Kind> | null {
+  const raw = process.env.FRESHDESK_ATTACHMENT_TYPES?.trim();
+  if (!raw) return null; // not set: every supported type is read
+  const enabled = new Set<Kind>();
+  const unknown: string[] = [];
+  for (const name of raw
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter(Boolean)) {
+    const kinds = ATTACHMENT_TYPES[name];
+    if (kinds) for (const k of kinds) enabled.add(k);
+    else unknown.push(name);
+  }
+  if (unknown.length) {
+    console.error(
+      `[freshdesk-mcp] FRESHDESK_ATTACHMENT_TYPES: ignoring unknown type(s) ${unknown.join(", ")}. Valid: ${Object.keys(ATTACHMENT_TYPES).join(", ")}`,
+    );
+  }
+  return enabled;
+}
+
+const ENABLED_KINDS = parseEnabledKinds();
+
+/** True when this kind may be read under the current configuration. */
+export function kindEnabled(kind: Kind): boolean {
+  if (!EXTRACTOR_KINDS.has(kind)) return true; // not readable anyway: reported as such
+  return ENABLED_KINDS === null || ENABLED_KINDS.has(kind);
+}
+
+/** Kinds that are recognised but never turned into content (no extractor). */
+const METADATA_ONLY: ReadonlySet<Kind> = new Set([
+  "legacy-office",
+  "archive-other",
+  "image-unsupported",
+]);
+
+/** Whether a file of this kind will be read, given its type and the configuration. */
+export function willAnalyse(kind: Kind): boolean {
+  return !NOT_ANALYSED.has(kind) && !METADATA_ONLY.has(kind) && kindEnabled(kind);
+}
+
+export const DISABLED_HANDLING = "not analysed (type disabled by FRESHDESK_ATTACHMENT_TYPES)";
+
 /** Kinds the model will never be able to read: skip the download entirely. */
 export const NOT_ANALYSED: ReadonlySet<Kind> = new Set(["video", "audio", "executable"]);
 
@@ -165,6 +238,7 @@ export const HANDLING: Record<Kind, string> = {
   executable: "executable, not analysed",
   "legacy-office": "legacy Office format, not supported (metadata only)",
   "archive-other": "archive format not supported (metadata only)",
+  "image-unsupported": "image format not supported (metadata only)",
   unknown: "detected after download",
 };
 
@@ -195,6 +269,8 @@ export function classifyByBytes(b: Buffer, byName: Kind): Kind {
   if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
     const brand = b.toString("ascii", 8, 12);
     if (/^(heic|heix|hevc|mif1|msf1)$/.test(brand)) return "image-convert";
+    // AVIF shares the ISO media container with MP4 but is a still image.
+    if (/^avi[fs]$/.test(brand)) return "image-unsupported";
     return "video";
   }
   if (b.length >= 4 && b.readUInt32BE(0) === 0x504b0304) {
@@ -242,9 +318,17 @@ export class Budget {
   chars: number;
   images: number;
   truncated = false;
+  /** False when the "image" type is disabled: no image (page render, embedded image, frame) is returned. */
+  readonly imagesEnabled = kindEnabled("image");
   constructor(readonly opts: ExtractOptions) {
     this.chars = opts.maxTextChars;
-    this.images = opts.maxImages;
+    this.images = this.imagesEnabled ? opts.maxImages : 0;
+  }
+  /** Why an image was not returned, for notes. */
+  imageLimitReason(): string {
+    return this.imagesEnabled
+      ? "max_pages/max_images reached"
+      : "images disabled by FRESHDESK_ATTACHMENT_TYPES";
   }
   takeText(s: string): string {
     if (s.length <= this.chars) {
@@ -259,7 +343,7 @@ export class Budget {
   }
   takeImage(): boolean {
     if (this.images <= 0) {
-      this.truncated = true;
+      if (this.imagesEnabled) this.truncated = true;
       return false;
     }
     this.images--;
@@ -401,9 +485,147 @@ interface Extracted {
 
 type Extractor = (b: Buffer, name: string, budget: Budget, depth: number) => Promise<Extracted>;
 
+/** Most frames returned for one animated GIF (also bounded by max_images). */
+const MAX_GIF_FRAMES = 8;
+
+export interface GifFrame {
+  png: Buffer;
+  /** Zero-based frame number in the GIF. */
+  index: number;
+  /** When the frame appears, in milliseconds from the start. */
+  at: number;
+  total: number;
+  durationMs: number;
+}
+
+/**
+ * Rebuilds the frames of an animated GIF (respecting partial frames, transparency
+ * and disposal) and returns up to maxFrames spread evenly over the animation time,
+ * so states shown for longer are more likely to be picked. Null when not animated.
+ */
+export async function gifFrames(b: Buffer, maxFrames: number): Promise<GifFrame[] | null> {
+  if (maxFrames <= 0) return null;
+  const { GifReader } = await import("omggif");
+  const reader = new GifReader(new Uint8Array(b));
+  const total = reader.numFrames();
+  if (total <= 1) return null;
+  const { width, height } = reader;
+
+  // Timeline. GIF delays are in centiseconds; 0 is shown by browsers as 100 ms.
+  const starts: number[] = [];
+  let t = 0;
+  for (let i = 0; i < total; i++) {
+    starts.push(t);
+    const delay = reader.frameInfo(i).delay;
+    t += (delay > 1 ? delay : 10) * 10;
+  }
+  const durationMs = t;
+
+  const count = Math.min(maxFrames, total);
+  const wanted = new Set<number>();
+  if (count >= total) {
+    for (let i = 0; i < total; i++) wanted.add(i);
+  } else {
+    // Always keep the first state, the final state and the frame shown longest
+    // (often the error message in a screen recording).
+    let longest = 0;
+    for (let i = 1; i < total; i++)
+      if (reader.frameInfo(i).delay > reader.frameInfo(longest).delay) longest = i;
+    const keep = [0, total - 1, longest].slice(0, count);
+    for (const i of keep) wanted.add(i);
+    // Then sample the timeline, so states shown for longer are more likely picked.
+    for (let k = 0; k < count && wanted.size < count; k++) {
+      const target = ((k + 0.5) * durationMs) / count;
+      let idx = 0;
+      for (let i = 0; i < total; i++) if (starts[i] <= target) idx = i;
+      wanted.add(idx);
+    }
+    // Fill any remaining slots with the frames farthest from those already picked.
+    while (wanted.size < count) {
+      let best = -1;
+      let bestGap = -1;
+      for (let i = 0; i < total; i++) {
+        if (wanted.has(i)) continue;
+        let gap = Number.POSITIVE_INFINITY;
+        for (const w of wanted) gap = Math.min(gap, Math.abs(i - w));
+        if (gap > bestGap) {
+          bestGap = gap;
+          best = i;
+        }
+      }
+      wanted.add(best);
+    }
+  }
+
+  const { Jimp } = await import("jimp");
+  const canvas = new Uint8Array(width * height * 4);
+  let saved: Uint8Array | null = null;
+  let prev: ReturnType<typeof reader.frameInfo> | null = null;
+  const last = Math.max(...wanted);
+  const frames: GifFrame[] = [];
+  for (let i = 0; i <= last; i++) {
+    const info = reader.frameInfo(i);
+    if (prev) {
+      if (prev.disposal === 2) {
+        // Restore to background: clear the previous frame's area.
+        for (let y = prev.y; y < prev.y + prev.height; y++)
+          canvas.fill(0, (y * width + prev.x) * 4, (y * width + prev.x + prev.width) * 4);
+      } else if (prev.disposal === 3 && saved) {
+        canvas.set(saved); // restore to previous
+      }
+    }
+    saved = info.disposal === 3 ? canvas.slice() : null;
+    reader.decodeAndBlitFrameRGBA(i, canvas);
+    prev = info;
+    if (!wanted.has(i)) continue;
+    // Flatten transparency onto white so the frame reads like it does on screen.
+    const rgba = Buffer.from(canvas);
+    for (let p = 0; p < rgba.length; p += 4) {
+      const a = rgba[p + 3] / 255;
+      rgba[p] = Math.round(rgba[p] * a + 255 * (1 - a));
+      rgba[p + 1] = Math.round(rgba[p + 1] * a + 255 * (1 - a));
+      rgba[p + 2] = Math.round(rgba[p + 2] * a + 255 * (1 - a));
+      rgba[p + 3] = 255;
+    }
+    const png = await new Jimp({ width, height, data: rgba }).getBuffer("image/png");
+    frames.push({ png, index: i, at: starts[i], total, durationMs });
+  }
+  return frames;
+}
+
+const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
+
 const extractImage: Extractor = async (b, name, budget) => {
+  if (sniffSupportedImage(b) === "image/gif") {
+    let frames: GifFrame[] | null = null;
+    try {
+      frames = await gifFrames(b, Math.min(MAX_GIF_FRAMES, budget.images));
+    } catch {
+      frames = null; // malformed animation: fall back to a single image
+    }
+    if (frames?.length) {
+      const content: Content[] = [
+        textBlock(
+          `Animated GIF: ${name}, ${frames[0].total} frames over ${seconds(frames[0].durationMs)}. ${frames.length} frame(s) shown in order:`,
+        ),
+      ];
+      for (const f of frames) {
+        if (!budget.takeImage()) break;
+        const img = (await toSupportedImage(f.png)) ?? { data: f.png, mimeType: "image/png" };
+        content.push(textBlock(`Frame ${f.index + 1} of ${f.total}, at ${seconds(f.at)}`), {
+          type: "image",
+          data: img.data.toString("base64"),
+          mimeType: img.mimeType,
+        });
+      }
+      const shown = content.filter((c) => c.type === "image").length;
+      const notes = [`animated GIF: ${shown} of ${frames[0].total} frames returned`];
+      if (shown < frames[0].total) budget.truncated = true;
+      return { kind: "image", content, notes };
+    }
+  }
   if (!budget.takeImage())
-    return { kind: "image", content: [], notes: ["image skipped: max_images reached"] };
+    return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
   if (!img) return { kind: "image-convert", content: [], notes: ["image could not be decoded"] };
   return {
@@ -614,6 +836,8 @@ const extractPdf: Extractor = async (b, _name, budget) => {
   let rendered = 0;
   let scannedPages = 0;
   let imagePages = 0;
+  let scannedRendered = 0;
+  let imagePagesRendered = 0;
   for (let n = 1; n <= doc.numPages; n++) {
     if (budget.chars <= 0 && budget.images <= 0) {
       notes.push(`stopped at page ${n - 1} of ${doc.numPages}: limits reached`);
@@ -637,7 +861,7 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     const why = scanned ? "scanned page" : `page with ${images} image(s)`;
     if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
       parts.push(
-        `--- Page ${n} --- (${why}, not rendered: max_pages/max_images reached)${scanned ? "" : `\n${pageText}`}`,
+        `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
       );
       budget.truncated = true;
       page.cleanup();
@@ -645,6 +869,8 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     }
     const jpg = await renderPage(page);
     rendered++;
+    if (scanned) scannedRendered++;
+    else imagePagesRendered++;
     // Text pages keep their text: the rendered image is only there for the pictures.
     parts.push(
       `--- Page ${n} --- (${why}, rendered as image ${rendered})${scanned ? "" : `\n${pageText}`}`,
@@ -658,10 +884,12 @@ const extractPdf: Extractor = async (b, _name, budget) => {
   }
   await doc.destroy();
   if (scannedPages > 0)
-    notes.push(`${scannedPages} page(s) had no text layer (scanned) and were rendered as images`);
+    notes.push(
+      `${scannedPages} page(s) had no text layer (scanned), ${scannedRendered} rendered as images`,
+    );
   if (imagePages > 0)
     notes.push(
-      `${imagePages} page(s) with text also contain images and were rendered as images too`,
+      `${imagePages} page(s) with text also contain images, ${imagePagesRendered} rendered as images`,
     );
   return {
     kind: "pdf",
@@ -691,7 +919,9 @@ const extractDocx: Extractor = async (b, _name, budget) => {
   const images: Content[] = [];
   for (let i = 0; i < embedded.length; i++) {
     if (!budget.takeImage()) {
-      notes.push(`embedded images ${i + 1} to ${embedded.length} skipped: max_images reached`);
+      notes.push(
+        `embedded images ${i + 1} to ${embedded.length} skipped: ${budget.imageLimitReason()}`,
+      );
       break;
     }
     const img = await toSupportedImage(embedded[i]);
@@ -912,9 +1142,12 @@ const extractZip: Extractor = async (b, name, budget, depth) => {
         if (f.name.endsWith("/")) return false;
         const kind = classifyByName(f.name, "");
         const skippedKind =
-          NOT_ANALYSED.has(kind) || kind === "legacy-office" || kind === "archive-other";
-        let status = HANDLING[kind];
-        let extract = !skippedKind;
+          NOT_ANALYSED.has(kind) ||
+          kind === "legacy-office" ||
+          kind === "archive-other" ||
+          kind === "image-unsupported";
+        let status = kindEnabled(kind) ? HANDLING[kind] : DISABLED_HANDLING;
+        let extract = !skippedKind && kindEnabled(kind);
         if (extract && depth >= MAX_ZIP_DEPTH) {
           status = `not extracted: nested deeper than ${MAX_ZIP_DEPTH} archive levels`;
           extract = false;
@@ -1156,6 +1389,8 @@ const EXTRACTORS: Partial<Record<Kind, Extractor>> = {
   text: extractText,
 };
 
+const EXTRACTOR_KINDS = new Set(Object.keys(EXTRACTORS) as Kind[]);
+
 /** Extracts any file. Never throws: failures become notes. */
 export async function extractAny(
   b: Buffer,
@@ -1166,6 +1401,7 @@ export async function extractAny(
 ): Promise<Extracted> {
   const byName = classifyByName(name, contentType);
   const kind = classifyByBytes(b, byName);
+  if (!kindEnabled(kind)) return { kind, content: [], notes: [DISABLED_HANDLING] };
   const fn = EXTRACTORS[kind];
   if (!fn) return { kind, content: [], notes: [HANDLING[kind]] };
   try {
