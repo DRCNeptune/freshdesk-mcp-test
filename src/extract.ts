@@ -424,6 +424,18 @@ async function loadPdfjs() {
   return pdfjsPromise;
 }
 
+let standardFonts: string | undefined;
+async function standardFontsPath(): Promise<string> {
+  if (!standardFonts) {
+    const { createRequire } = await import("node:module");
+    const { dirname, join, sep } = await import("node:path");
+    const require = createRequire(import.meta.url);
+    standardFonts =
+      join(dirname(require.resolve("pdfjs-dist/package.json")), "standard_fonts") + sep;
+  }
+  return standardFonts;
+}
+
 class NapiCanvasFactory {
   private napi: typeof import("@napi-rs/canvas");
   constructor(napi: typeof import("@napi-rs/canvas")) {
@@ -446,6 +458,102 @@ class NapiCanvasFactory {
 /** Pages with fewer characters than this are treated as scanned and rendered. */
 const SCANNED_PAGE_CHARS = 25;
 
+/**
+ * Images smaller than this on both sides (logos, icons, bullets) do not justify
+ * rendering a page that already has text. Same rule as min_dimension for inline images.
+ */
+const PDF_IMAGE_MIN_PX = 100;
+
+interface PdfTextItem {
+  str?: string;
+  hasEOL?: boolean;
+  width?: number;
+  transform?: number[];
+}
+
+/**
+ * Joins pdf.js text items using their positions instead of always adding a space.
+ * Word splits words into several runs (kerning, font changes), so "Isto" can arrive
+ * as "I" + "s" + "to". A space is only added when the gap to the previous item is
+ * larger than a fraction of the font size, and a line break when the baseline moves.
+ */
+export function joinPdfTextItems(items: PdfTextItem[]): string {
+  let text = "";
+  let prevEnd: number | undefined;
+  let prevY: number | undefined;
+  for (const item of items) {
+    if (typeof item.str !== "string") continue;
+    const t = item.transform ?? [1, 0, 0, 1, 0, 0];
+    const x = t[4];
+    const y = t[5];
+    const size = Math.hypot(t[0], t[1]) || 1;
+    if (item.str === "") {
+      if (item.hasEOL) {
+        text += "\n";
+        prevEnd = undefined;
+      }
+      continue;
+    }
+    if (prevY !== undefined && prevEnd !== undefined && Math.abs(y - prevY) > size * 0.5) {
+      // Baseline moved without an explicit end of line: new line.
+      text += "\n";
+      prevEnd = undefined;
+    }
+    if (prevEnd !== undefined && x - prevEnd > size * 0.15 && !text.endsWith(" ")) text += " ";
+    text += item.str;
+    prevY = y;
+    prevEnd = item.hasEOL ? undefined : x + (item.width ?? 0);
+    if (item.hasEOL) text += "\n";
+  }
+  return text
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+/** Counts images on a page that are big enough to matter (ignores logos and icons). */
+async function countSignificantImages(
+  // biome-ignore lint/suspicious/noExplicitAny: pdf.js page proxy.
+  page: any,
+  ops: Record<string, number>,
+): Promise<number> {
+  const imageOps = new Set([
+    ops.paintImageXObject,
+    ops.paintInlineImageXObject,
+    ops.paintImageMaskXObject,
+    ops.paintImageXObjectRepeat,
+  ]);
+  const list = await page.getOperatorList();
+  let count = 0;
+  for (let i = 0; i < list.fnArray.length; i++) {
+    if (!imageOps.has(list.fnArray[i])) continue;
+    const args = list.argsArray[i] ?? [];
+    let w: number | undefined;
+    let h: number | undefined;
+    if (typeof args[0] === "string" && typeof args[1] === "number") {
+      // paintImageXObject: [objId, width, height]
+      w = args[1];
+      h = args[2];
+    } else if (args[0] && typeof args[0] === "object" && "width" in args[0]) {
+      // Inline images and image masks carry their data object.
+      w = args[0].width;
+      h = args[0].height;
+    } else if (typeof args[0] === "string") {
+      try {
+        const obj = page.objs.get(args[0]);
+        w = obj?.width;
+        h = obj?.height;
+      } catch {
+        // Object not resolved: unknown size, ignore.
+      }
+    }
+    if (w === undefined || h === undefined) continue;
+    if (w < PDF_IMAGE_MIN_PX && h < PDF_IMAGE_MIN_PX) continue;
+    count++;
+  }
+  return count;
+}
+
 const extractPdf: Extractor = async (b, _name, budget) => {
   const pdfjs = await loadPdfjs();
   const napi = await import("@napi-rs/canvas");
@@ -457,6 +565,8 @@ const extractPdf: Extractor = async (b, _name, budget) => {
       // biome-ignore lint/suspicious/noExplicitAny: pdf.js 4.4 accepts a factory instance here.
       canvasFactory: new NapiCanvasFactory(napi) as any,
       isEvalSupported: false,
+      // Lets pdf.js draw the 14 standard PDF fonts when a document does not embed them.
+      standardFontDataUrl: await standardFontsPath(),
       disableFontFace: true,
       useSystemFonts: false,
       verbosity: 0,
@@ -469,36 +579,8 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     return { kind: "pdf", content: [], notes: [msg] };
   }
 
-  const content: Content[] = [];
-  const parts: string[] = [];
-  let rendered = 0;
-  let scannedPages = 0;
-  for (let n = 1; n <= doc.numPages; n++) {
-    if (budget.chars <= 0 && budget.images <= 0) {
-      notes.push(`stopped at page ${n - 1} of ${doc.numPages}: limits reached`);
-      budget.truncated = true;
-      break;
-    }
-    const page = await doc.getPage(n);
-    const tc = await page.getTextContent();
-    let pageText = "";
-    for (const item of tc.items as { str?: string; hasEOL?: boolean }[]) {
-      if (typeof item.str !== "string") continue;
-      pageText += item.str + (item.hasEOL ? "\n" : " ");
-    }
-    pageText = pageText.replace(/[ \t]+\n/g, "\n").trim();
-
-    if (pageText.length >= SCANNED_PAGE_CHARS) {
-      parts.push(`--- Page ${n} ---\n${pageText}`);
-      continue;
-    }
-
-    scannedPages++;
-    if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
-      parts.push(`--- Page ${n} --- (scanned page not rendered: max_pages/max_images reached)`);
-      budget.truncated = true;
-      continue;
-    }
+  // biome-ignore lint/suspicious/noExplicitAny: pdf.js page proxy.
+  const renderPage = async (page: any): Promise<Buffer> => {
     const base = page.getViewport({ scale: 1 });
     const scale = Math.min(2.5, MAX_IMAGE_EDGE / Math.max(base.width, base.height));
     const vp = page.getViewport({ scale });
@@ -508,18 +590,63 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     // biome-ignore lint/suspicious/noExplicitAny: napi-rs context is API compatible with CanvasRenderingContext2D.
     await page.render({ canvasContext: ctx as any, viewport: vp }).promise;
-    const jpg = canvas.toBuffer("image/jpeg", 85);
+    return canvas.toBuffer("image/jpeg", 85);
+  };
+
+  const content: Content[] = [];
+  const parts: string[] = [];
+  let rendered = 0;
+  let scannedPages = 0;
+  let imagePages = 0;
+  for (let n = 1; n <= doc.numPages; n++) {
+    if (budget.chars <= 0 && budget.images <= 0) {
+      notes.push(`stopped at page ${n - 1} of ${doc.numPages}: limits reached`);
+      budget.truncated = true;
+      break;
+    }
+    const page = await doc.getPage(n);
+    const tc = await page.getTextContent();
+    const pageText = joinPdfTextItems(tc.items as PdfTextItem[]);
+    const scanned = pageText.length < SCANNED_PAGE_CHARS;
+    const images = scanned ? 0 : await countSignificantImages(page, pdfjs.OPS);
+
+    if (!scanned && images === 0) {
+      parts.push(`--- Page ${n} ---\n${pageText}`);
+      page.cleanup();
+      continue;
+    }
+
+    if (scanned) scannedPages++;
+    else imagePages++;
+    const why = scanned ? "scanned page" : `page with ${images} image(s)`;
+    if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: max_pages/max_images reached)${scanned ? "" : `\n${pageText}`}`,
+      );
+      budget.truncated = true;
+      page.cleanup();
+      continue;
+    }
+    const jpg = await renderPage(page);
     rendered++;
-    parts.push(`--- Page ${n} --- (scanned page, rendered as image ${rendered})`);
+    // Text pages keep their text: the rendered image is only there for the pictures.
+    parts.push(
+      `--- Page ${n} --- (${why}, rendered as image ${rendered})${scanned ? "" : `\n${pageText}`}`,
+    );
     content.push(textBlock(`Rendered page ${n}`), {
       type: "image",
       data: jpg.toString("base64"),
       mimeType: "image/jpeg",
     });
+    page.cleanup();
   }
   await doc.destroy();
   if (scannedPages > 0)
     notes.push(`${scannedPages} page(s) had no text layer (scanned) and were rendered as images`);
+  if (imagePages > 0)
+    notes.push(
+      `${imagePages} page(s) with text also contain images and were rendered as images too`,
+    );
   return {
     kind: "pdf",
     content: [

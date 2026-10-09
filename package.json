@@ -18,7 +18,8 @@
     "dev:http": "tsc && MCP_TRANSPORT=http node dist/index.js",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
-    "format": "biome format --write src/"
+    "format": "biome format --write src/",
+    "extract": "node scripts/extract-file.mjs"
   },
   "files": [
     "dist",
