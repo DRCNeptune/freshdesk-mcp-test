@@ -5,12 +5,16 @@ import { z } from "zod";
 import {
   Budget,
   classifyByName,
+  DISABLED_HANDLING,
   extractAny,
+  type GifFrame,
+  gifFrames,
   HANDLING,
+  kindEnabled,
   MIN_IMAGE_DIMENSION,
-  NOT_ANALYSED,
   toSupportedImage,
   UNTRUSTED_NOTICE,
+  willAnalyse,
 } from "../extract.js";
 import { errorPayload, type FreshdeskResult, fd, parseLinkHeader } from "../freshdesk.js";
 import { text, tool } from "../util.js";
@@ -379,8 +383,8 @@ export function registerAttachmentTools(server: McpServer) {
               created_at: c.att.created_at,
               origin: c.origin,
               conversation_id: c.conversation_id ?? null,
-              handling: HANDLING[kind],
-              analysed: !NOT_ANALYSED.has(kind),
+              handling: kindEnabled(kind) ? HANDLING[kind] : DISABLED_HANDLING,
+              analysed: willAnalyse(kind),
             };
           });
         const counts: Record<string, number> = {};
@@ -473,12 +477,20 @@ export function registerAttachmentTools(server: McpServer) {
         scan_state: att.scan_state ?? null,
       };
 
-      if (NOT_ANALYSED.has(kindByName)) {
+      if (!willAnalyse(kindByName) && kindEnabled(kindByName)) {
         return text({
           ...meta,
           handling: HANDLING[kindByName],
           analysed: false,
-          reason: "This file type is not analysed. It was not downloaded.",
+          reason: "This file type cannot be read. It was not downloaded.",
+        });
+      }
+      if (!kindEnabled(kindByName)) {
+        return text({
+          ...meta,
+          handling: DISABLED_HANDLING,
+          analysed: false,
+          reason: "This file type is disabled by the server configuration. It was not downloaded.",
         });
       }
       if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
@@ -543,6 +555,8 @@ export function registerAttachmentTools(server: McpServer) {
       max_images,
       min_dimension,
     }): Promise<CallToolResult> => {
+      if (!kindEnabled("image"))
+        return text({ ticket_id, error: "Images are disabled by FRESHDESK_ATTACHMENT_TYPES" });
       const t = await fetchTicket(ticket_id);
       if (!t.ok) return text(errorPayload("Failed to fetch ticket", t.res));
 
@@ -575,6 +589,7 @@ export function registerAttachmentTools(server: McpServer) {
       const skipped: { src: string; origin: string; conversation_id?: number; reason: string }[] =
         [];
       const returned: Record<string, unknown>[] = [];
+      let imageBlocks = 0;
       const images: Content[] = [];
       const seenUrls = new Set<string>();
       const seenHashes = new Set<string>();
@@ -589,7 +604,7 @@ export function registerAttachmentTools(server: McpServer) {
             reason,
           });
 
-        if (returned.length >= max_images) {
+        if (imageBlocks >= max_images) {
           skip("max_images reached");
           continue;
         }
@@ -659,6 +674,16 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
 
+        // Animated GIFs (screen recordings) are returned as a sequence of frames.
+        let frames: GifFrame[] | null = null;
+        if (mime === "image/gif") {
+          try {
+            frames = await gifFrames(bytes, Math.min(8, max_images - imageBlocks));
+          } catch {
+            frames = null;
+          }
+        }
+
         // Shrink very large screenshots so they fit the model's image limits.
         const fitted = await toSupportedImage(bytes);
         if (fitted) {
@@ -684,12 +709,37 @@ export function registerAttachmentTools(server: McpServer) {
           width: size?.width ?? null,
           height: size?.height ?? null,
         };
+        const label = `Image ${index}: ${s.origin}${s.conversation_id ? ` (conversation ${s.conversation_id})` : ""}${s.created_at ? `, ${s.created_at}` : ""}`;
+        if (frames?.length) {
+          returned.push({
+            ...info,
+            animated: true,
+            total_frames: frames[0].total,
+            frames_returned: frames.length,
+          });
+          images.push({
+            type: "text",
+            text: `${label}. Animated GIF, ${frames[0].total} frames over ${(frames[0].durationMs / 1000).toFixed(1)} s, ${frames.length} frame(s) shown in order:`,
+          });
+          for (const f of frames) {
+            const img = (await toSupportedImage(f.png)) ?? { data: f.png, mimeType: "image/png" };
+            images.push({
+              type: "text",
+              text: `Frame ${f.index + 1} of ${f.total}, at ${(f.at / 1000).toFixed(1)} s`,
+            });
+            images.push({
+              type: "image",
+              data: img.data.toString("base64"),
+              mimeType: img.mimeType,
+            });
+            imageBlocks++;
+          }
+          continue;
+        }
         returned.push(info);
-        images.push({
-          type: "text",
-          text: `Image ${index}: ${s.origin}${s.conversation_id ? ` (conversation ${s.conversation_id})` : ""}${s.created_at ? `, ${s.created_at}` : ""}`,
-        });
+        images.push({ type: "text", text: label });
         images.push({ type: "image", data: bytes.toString("base64"), mimeType: mime });
+        imageBlocks++;
       }
 
       const summary = {
