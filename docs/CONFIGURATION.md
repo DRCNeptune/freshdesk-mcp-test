@@ -13,7 +13,7 @@ All configuration is via environment variables (read at process start) plus an o
 | `MCP_TRANSPORT`      | no       | `stdio` | `stdio`, `http`                  | Which MCP transport to expose.                                                                           |
 | `PORT`               | no       | `3000`  | int 1–65535                      | HTTP listen port. Only used when `MCP_TRANSPORT=http`.                                                   |
 | `FRESHDESK_ATTACHMENT_HOSTS` | no | `freshdesk.com,freshworks.com` | comma-separated hostnames | Hosts that `get_ticket_attachment` and `get_ticket_inline_images` may download from (subdomains included). `FRESHDESK_DOMAIN` is always added. Protects against SSRF through customer supplied `<img>` tags. `attachment_url` values returned by the Freshdesk API are also allowed on `amazonaws.com` (older attachments are pre-signed S3 URLs), but `<img>` tags in message bodies are not. |
-| `FRESHDESK_MAX_ATTACHMENT_BYTES` | no | `5242880` (5 MB) | int | Per file download limit for attachments and inline images. |
+| `FRESHDESK_MAX_ATTACHMENT_BYTES` | no | `26214400` (25 MB) | int | Per file download limit for attachments and inline images. What is returned to the model is limited separately by the tool parameters. |
 | `FRESHDESK_MAX_TOTAL_ATTACHMENT_BYTES` | no | `20971520` (20 MB) | int | Total image bytes returned by a single `get_ticket_inline_images` call. |
 | `NODE_ENV`           | no       | unset   | `production`, `development`, ... | Standard Node convention. Only affects defaults in some downstream libs.                                 |
 
