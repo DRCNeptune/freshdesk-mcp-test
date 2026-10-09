@@ -572,50 +572,115 @@ const extractDocx: Extractor = async (b, _name, budget) => {
   };
 };
 
-function cellText(v: unknown): string {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Date) {
-    const iso = v.toISOString();
-    return iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso;
-  }
-  if (typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    if (Array.isArray(o.richText))
-      return (o.richText as { text: string }[]).map((r) => r.text).join("");
-    if ("result" in o && o.result !== undefined) return cellText(o.result);
-    if ("formula" in o) return `=${o.formula}`;
-    if ("sharedFormula" in o) return `=${o.sharedFormula}`;
-    if ("text" in o) return String(o.text);
-    if ("error" in o) return String(o.error);
-  }
-  return String(v);
+/* XLSX is read directly from its XML parts (ZIP + SpreadsheetML), avoiding a heavy dependency. */
+
+const BUILTIN_DATE_FORMATS = new Set([14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47]);
+
+function xmlAttr(tag: string, name: string): string | undefined {
+  return tag.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
+}
+
+/** Column letters (A, B, ..., AA) to a zero-based index. */
+function colIndex(ref: string): number {
+  const letters = ref.match(/^[A-Z]+/)?.[0] ?? "A";
+  let n = 0;
+  for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+
+function excelSerialToDate(serial: number): string {
+  const ms = Math.round((serial - 25569) * 86400 * 1000);
+  const iso = new Date(ms).toISOString();
+  return iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso.replace(".000Z", "Z");
+}
+
+function inlineText(xml: string): string {
+  return [...xml.matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g)]
+    .map((m) => decodeXmlEntities(m[1]))
+    .join("");
 }
 
 const extractXlsx: Extractor = async (b, _name, budget) => {
-  const ExcelJS = (await import("exceljs")).default;
-  const wb = new ExcelJS.Workbook();
-  // biome-ignore lint/suspicious/noExplicitAny: exceljs typings expect its own Buffer type.
-  await wb.xlsx.load(b as any);
-  const notes: string[] = [];
+  const { unzipSync, strFromU8 } = await import("fflate");
+  const files = unzipSync(new Uint8Array(b), {
+    filter: (f) =>
+      /^xl\/(workbook\.xml|sharedStrings\.xml|styles\.xml|_rels\/workbook\.xml\.rels|worksheets\/[^/]+\.xml)$/.test(
+        f.name,
+      ) && f.originalSize <= MAX_ZIP_UNCOMPRESSED,
+  });
+  const read = (p: string) => (files[p] ? strFromU8(files[p]) : "");
+
+  const shared = [...read("xl/sharedStrings.xml").matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) =>
+    inlineText(m[1]),
+  );
+
+  // Styles: which cell formats are dates.
+  const stylesXml = read("xl/styles.xml");
+  const customDateFmts = new Set<number>();
+  for (const m of stylesXml.matchAll(/<numFmt\b[^>]*>/g)) {
+    const id = Number(xmlAttr(m[0], "numFmtId"));
+    const code = (xmlAttr(m[0], "formatCode") ?? "").replace(/"[^"]*"|\[[^\]]*\]/g, "");
+    if (/[dmyhs]/i.test(code)) customDateFmts.add(id);
+  }
+  const xfsBlock = stylesXml.match(/<cellXfs\b[\s\S]*?<\/cellXfs>/)?.[0] ?? "";
+  const dateStyles = [...xfsBlock.matchAll(/<xf\b[^>]*>/g)].map((m) => {
+    const id = Number(xmlAttr(m[0], "numFmtId") ?? 0);
+    return BUILTIN_DATE_FORMATS.has(id) || customDateFmts.has(id);
+  });
+
+  // Sheet names in workbook order, mapped to their XML files.
+  const rels = new Map<string, string>();
+  for (const m of read("xl/_rels/workbook.xml.rels").matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = xmlAttr(m[0], "Id");
+    const target = xmlAttr(m[0], "Target");
+    if (id && target) rels.set(id, target.replace(/^\/?(xl\/)?/, "xl/"));
+  }
+  const sheets = [...read("xl/workbook.xml").matchAll(/<sheet\b[^>]*>/g)].map((m) => ({
+    name: decodeXmlEntities(xmlAttr(m[0], "name") ?? "Sheet"),
+    path: rels.get(xmlAttr(m[0], "r:id") ?? "") ?? "",
+  }));
+
   const parts: string[] = [];
-  wb.eachSheet((ws) => {
-    const rows: unknown[][] = [];
+  for (const sheet of sheets) {
+    const xml = read(sheet.path);
+    if (!xml) continue;
+    const rows: string[][] = [];
     let total = 0;
-    ws.eachRow({ includeEmpty: false }, (row) => {
+    for (const rm of xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells: string[] = [];
+      for (const cm of rm[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+        const attrs = cm[1];
+        const inner = cm[2] ?? "";
+        const type = xmlAttr(attrs, "t");
+        const value = inner.match(/<v>([\s\S]*?)<\/v>/)?.[1];
+        const formula = inner.match(/<f\b[^>]*>([\s\S]*?)<\/f>/)?.[1];
+        let text = "";
+        if (type === "s") text = shared[Number(value)] ?? "";
+        else if (type === "inlineStr") text = inlineText(inner);
+        else if (type === "b") text = value === "1" ? "TRUE" : "FALSE";
+        else if (value !== undefined && value !== "") {
+          const style = Number(xmlAttr(attrs, "s") ?? 0);
+          const num = Number(value);
+          text =
+            type !== "str" && type !== "e" && dateStyles[style] && Number.isFinite(num)
+              ? excelSerialToDate(num)
+              : decodeXmlEntities(value);
+        } else if (formula) text = `=${decodeXmlEntities(formula)}`;
+        cells[colIndex(xmlAttr(attrs, "r") ?? "A")] = text;
+      }
+      if (cells.every((c) => !c)) continue;
       total++;
-      if (rows.length >= MAX_TABLE_ROWS) return;
-      const values = (row.values as unknown[]).slice(1).map(cellText);
-      rows.push(values);
-    });
+      if (rows.length < MAX_TABLE_ROWS) rows.push(Array.from(cells, (c) => c ?? ""));
+    }
     const more =
       total > rows.length ? `\n\n[TRUNCATED: ${total - rows.length} more row(s) not shown]` : "";
     if (more) budget.truncated = true;
-    parts.push(`## Sheet: ${ws.name} (${total} row(s))\n\n${markdownTable(rows)}${more}`);
-  });
+    parts.push(`## Sheet: ${sheet.name} (${total} row(s))\n\n${markdownTable(rows)}${more}`);
+  }
   return {
     kind: "xlsx",
     content: [textBlock(budget.takeText(parts.join("\n\n") || "(empty workbook)"))],
-    notes,
+    notes: [],
   };
 };
 
