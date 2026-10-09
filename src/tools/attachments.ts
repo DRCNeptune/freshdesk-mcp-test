@@ -27,9 +27,7 @@ const MAX_CONVERSATION_PAGES = 20;
  * pre-signed (CloudFront / S3), so no Freshdesk credentials are ever sent.
  * The allowlist prevents SSRF through customer supplied <img> tags.
  */
-const ALLOWED_HOSTS = (
-  process.env.FRESHDESK_ATTACHMENT_HOSTS ?? "freshdesk.com,freshworks.com"
-)
+const ALLOWED_HOSTS = (process.env.FRESHDESK_ATTACHMENT_HOSTS ?? "freshdesk.com,freshworks.com")
   .split(",")
   .map((h) => h.trim().toLowerCase())
   .filter(Boolean);
@@ -103,12 +101,24 @@ async function fetchAllConversations(
 /* Safe download                                                              */
 /* -------------------------------------------------------------------------- */
 
-function hostAllowed(url: URL): boolean {
+/**
+ * Extra hosts accepted only for attachment_url values returned by the Freshdesk
+ * API itself (never for <img src> found in message bodies, which a customer can
+ * control). Older attachments are served as pre-signed S3 URLs, for example
+ * https://s3.amazonaws.com/cdn.freshdesk.com/data/helpdesk/attachments/...
+ */
+const API_ATTACHMENT_EXTRA_HOSTS = ["amazonaws.com"];
+
+function hostAllowed(url: URL, trusted: boolean): boolean {
   const host = url.hostname.toLowerCase();
-  return ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+  const hosts = trusted ? [...ALLOWED_HOSTS, ...API_ATTACHMENT_EXTRA_HOSTS] : ALLOWED_HOSTS;
+  return hosts.some((h) => host === h || host.endsWith(`.${h}`));
 }
 
-function checkUrl(raw: string): { ok: true; url: URL } | { ok: false; reason: string } {
+function checkUrl(
+  raw: string,
+  trusted: boolean,
+): { ok: true; url: URL } | { ok: false; reason: string } {
   let url: URL;
   try {
     url = new URL(raw);
@@ -116,7 +126,7 @@ function checkUrl(raw: string): { ok: true; url: URL } | { ok: false; reason: st
     return { ok: false, reason: "invalid URL" };
   }
   if (url.protocol !== "https:") return { ok: false, reason: "only https URLs are downloaded" };
-  if (!hostAllowed(url)) return { ok: false, reason: `host not allowed: ${url.hostname}` };
+  if (!hostAllowed(url, trusted)) return { ok: false, reason: `host not allowed: ${url.hostname}` };
   return { ok: true, url };
 }
 
@@ -129,10 +139,10 @@ type Download =
  * Redirects are followed manually so every hop is checked against the allowlist,
  * and the body is streamed so oversized files are aborted early.
  */
-async function download(raw: string, maxBytes: number): Promise<Download> {
+async function download(raw: string, maxBytes: number, trusted = false): Promise<Download> {
   let current = raw;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const checked = checkUrl(current);
+    const checked = checkUrl(current, trusted);
     if (!checked.ok) return checked;
 
     let res: Response;
@@ -210,8 +220,38 @@ function sniffImageType(b: Buffer): string | null {
     b.toString("ascii", 8, 12) === "WEBP"
   )
     return "image/webp";
-  if (b.length >= 2 && b.toString("ascii", 0, 2) === "BM") return "image/bmp";
   return null;
+}
+
+/** Image formats that MCP clients and the model can display. */
+const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/** Best-effort file type detection from magic bytes, used to label files we cannot return. */
+function sniffFileType(b: Buffer): string | null {
+  const img = sniffImageType(b);
+  if (img) return img;
+  if (b.length >= 4 && b.toString("ascii", 0, 4) === "%PDF") return "application/pdf";
+  if (b.length >= 4 && b.readUInt32BE(0) === 0x504b0304) return "application/zip";
+  if (b.length >= 2 && b.toString("ascii", 0, 2) === "BM") return "image/bmp";
+  if (b.length >= 4 && (b.readUInt32BE(0) === 0x49492a00 || b.readUInt32BE(0) === 0x4d4d002a))
+    return "image/tiff";
+  if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
+    const brand = b.toString("ascii", 8, 12);
+    if (/^(heic|heix|mif1|msf1)$/.test(brand)) return "image/heic";
+    if (brand.startsWith("qt")) return "video/quicktime";
+    return "video/mp4";
+  }
+  if (b.length >= 3 && b[0] === 0x1f && b[1] === 0x8b) return "application/gzip";
+  if (b.length >= 6 && b.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])))
+    return "application/x-7z-compressed";
+  if (b.length >= 4 && b.toString("ascii", 0, 4) === "Rar!") return "application/vnd.rar";
+  if (b.length >= 8 && b.readUInt32BE(0) === 0xd0cf11e0) return "application/x-ole-storage";
+  return null;
+}
+
+/** True when the buffer looks like binary data (NUL bytes in the first 8 KB). */
+function looksBinary(b: Buffer): boolean {
+  return b.subarray(0, 8192).includes(0);
 }
 
 /** Reads width and height from the image header. Returns null when unknown. */
@@ -323,12 +363,79 @@ const TEXT_EXTENSIONS = new Set([
   "har",
 ]);
 
+const TEXT_CONTENT_TYPES = new Set([
+  "application/json",
+  "application/xml",
+  "application/yaml",
+  "application/x-yaml",
+  "application/javascript",
+  "application/x-sh",
+  "application/sql",
+  "application/x-ndjson",
+  "application/har+json",
+]);
+
+/** Extensions of files the model cannot read directly (documents, archives, media, binaries). */
+const NON_READABLE_EXTENSIONS = new Set([
+  "pdf",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "ppt",
+  "pptx",
+  "odt",
+  "ods",
+  "odp",
+  "rtf",
+  "zip",
+  "rar",
+  "7z",
+  "gz",
+  "tgz",
+  "tar",
+  "bz2",
+  "xz",
+  "mp4",
+  "mov",
+  "avi",
+  "mkv",
+  "webm",
+  "wmv",
+  "m4v",
+  "mp3",
+  "wav",
+  "m4a",
+  "ogg",
+  "exe",
+  "dll",
+  "msi",
+  "dmg",
+  "apk",
+  "ipa",
+  "jar",
+  "bin",
+  "iso",
+  "bmp",
+  "tif",
+  "tiff",
+  "heic",
+  "heif",
+  "psd",
+  "ai",
+  "eps",
+]);
+
+function extension(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
+}
+
 function isTextLike(contentType: string, name: string): boolean {
   const ct = contentType.toLowerCase();
   if (ct.startsWith("text/")) return true;
-  if (/(json|xml|yaml|csv|javascript|x-sh|sql)/.test(ct)) return true;
-  const ext = name.toLowerCase().split(".").pop() ?? "";
-  return TEXT_EXTENSIONS.has(ext);
+  if (TEXT_CONTENT_TYPES.has(ct) || ct.endsWith("+json")) return true;
+  return TEXT_EXTENSIONS.has(extension(name));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -339,7 +446,7 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachment",
-    "Download a file attachment from a ticket or any of its conversations. Images are returned as image content, text files (log, txt, json, xml, csv, yaml) as text, and other files (PDF, zip, ...) as an embedded base64 resource. Attachment ids come from get_ticket or get_ticket_conversation.",
+    "Read a file attachment from a ticket or any of its conversations. PNG, JPEG, GIF and WebP images are returned as image content and text files (log, txt, json, xml, csv, yaml, har, ...) as text. Other files (PDF, Office documents, archives, video, other image formats) cannot be read by the model: the tool returns their metadata and detected type instead, unless include_raw is true. Attachment ids come from get_ticket or get_ticket_conversation.",
     {
       ticket_id: z.number().int(),
       attachment_id: z.number().int(),
@@ -350,8 +457,15 @@ export function registerAttachmentTools(server: McpServer) {
         .optional()
         .default(100_000)
         .describe("Text files longer than this are truncated (default 100000 characters)."),
+      include_raw: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Return files that are not text or a supported image as an embedded base64 resource. Only useful for clients that can handle binary resources (default false).",
+        ),
     },
-    async ({ ticket_id, attachment_id, max_text_chars }): Promise<CallToolResult> => {
+    async ({ ticket_id, attachment_id, max_text_chars, include_raw }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
       const t = await fetchTicket(ticket_id);
       if (!t.ok) return text(errorPayload("Failed to fetch ticket", t.res));
@@ -399,6 +513,33 @@ export function registerAttachmentTools(server: McpServer) {
       };
 
       if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
+
+      const ext = extension(name);
+      const declaredType = (att.content_type ?? "application/octet-stream")
+        .split(";")[0]
+        .trim()
+        .toLowerCase();
+      const notReadable = (detectedType: string | null) =>
+        text({
+          ...meta,
+          detected_type: detectedType ?? declaredType,
+          readable: false,
+          reason:
+            "This file type cannot be read by the model. Only text files and PNG, JPEG, GIF or WebP images are returned as content.",
+          hint: "Pass include_raw: true to receive the file as a base64 resource if your client can handle binary files.",
+        });
+
+      // Skip the download entirely for types we would not return anyway.
+      const declaredNonReadable =
+        NON_READABLE_EXTENSIONS.has(ext) ||
+        /^(video|audio)\//.test(declaredType) ||
+        declaredType === "application/pdf" ||
+        declaredType.includes("officedocument") ||
+        declaredType.includes("msword") ||
+        declaredType.includes("ms-excel") ||
+        declaredType.includes("zip");
+      if (declaredNonReadable && !include_raw) return notReadable(null);
+
       if (att.size && att.size > MAX_FILE_BYTES) {
         return text({
           ...meta,
@@ -406,29 +547,34 @@ export function registerAttachmentTools(server: McpServer) {
         });
       }
 
-      const dl = await download(att.attachment_url, MAX_FILE_BYTES);
+      // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
+      const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
       if (!dl.ok) return text({ ...meta, error: `Download failed: ${dl.reason}` });
 
-      const declaredType = (att.content_type ?? dl.contentType ?? "application/octet-stream")
-        .split(";")[0]
-        .trim()
-        .toLowerCase();
-      const sniffed = sniffImageType(dl.bytes);
+      const detected = sniffFileType(dl.bytes);
       const header: Content = {
         type: "text",
-        text: JSON.stringify({ ...meta, downloaded_bytes: dl.bytes.length }, null, 2),
+        text: JSON.stringify(
+          { ...meta, detected_type: detected ?? declaredType, downloaded_bytes: dl.bytes.length },
+          null,
+          2,
+        ),
       };
 
-      if (sniffed) {
+      if (detected && SUPPORTED_IMAGE_TYPES.has(detected)) {
         return {
           content: [
             header,
-            { type: "image", data: dl.bytes.toString("base64"), mimeType: sniffed },
+            { type: "image", data: dl.bytes.toString("base64"), mimeType: detected },
           ],
         };
       }
 
-      if (isTextLike(declaredType, name)) {
+      const textCandidate =
+        !detected &&
+        !looksBinary(dl.bytes) &&
+        (isTextLike(declaredType, name) || declaredType === "application/octet-stream");
+      if (textCandidate) {
         const body = dl.bytes.toString("utf8");
         const truncated = body.length > max_text_chars;
         return {
@@ -444,6 +590,8 @@ export function registerAttachmentTools(server: McpServer) {
         };
       }
 
+      if (!include_raw) return notReadable(detected);
+
       return {
         content: [
           header,
@@ -451,7 +599,7 @@ export function registerAttachmentTools(server: McpServer) {
             type: "resource",
             resource: {
               uri: `freshdesk://tickets/${ticket_id}/attachments/${att.id}/${encodeURIComponent(name)}`,
-              mimeType: declaredType,
+              mimeType: detected ?? declaredType,
               blob: dl.bytes.toString("base64"),
             },
           },
@@ -572,7 +720,8 @@ export function registerAttachmentTools(server: McpServer) {
 
         const mime = sniffImageType(bytes);
         if (!mime) {
-          skip("not a supported image format");
+          const other = sniffFileType(bytes);
+          skip(other ? `unsupported image format (${other})` : "not a supported image format");
           continue;
         }
 

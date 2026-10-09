@@ -88,10 +88,10 @@
 
 | Tool | Description | Params | Docs |
 | --- | --- | --- | --- |
-| `get_ticket_attachment` | Download a file attachment from a ticket or any of its conversations. Images return as MCP `image` content, text files (log, txt, json, xml, csv, yaml) as `text`, other files (PDF, zip, ...) as an embedded base64 `resource`. | `ticket_id`, `attachment_id`, `max_text_chars` | [↗](https://developers.freshdesk.com/api/#view_a_ticket) |
+| `get_ticket_attachment` | Read an attachment from a ticket or any of its conversations. PNG, JPEG, GIF and WebP images return as MCP `image` content and text files (log, txt, json, xml, csv, yaml, har, ...) as `text`. Other files (PDF, Office documents, archives, video, other image formats) return metadata and the detected type, or an embedded base64 `resource` when `include_raw` is true. | `ticket_id`, `attachment_id`, `max_text_chars`, `include_raw` | [↗](https://developers.freshdesk.com/api/#view_a_ticket) |
 | `get_ticket_inline_images` | Return images pasted inline into the ticket description and conversation bodies (not listed in `attachments`), as MCP `image` content labeled by origin, preceded by a JSON summary of found, returned and skipped images. | `ticket_id`, `include_conversations`, `max_images`, `min_dimension` | [↗](https://developers.freshdesk.com/api/#list_all_ticket_notes) |
 
-Both tools re-read the ticket on every call because attachment URLs are pre-signed and expire. Downloads never send Freshdesk credentials, only use HTTPS, only reach hosts in `FRESHDESK_ATTACHMENT_HOSTS` (checked again on every redirect) and are capped by `FRESHDESK_MAX_ATTACHMENT_BYTES`. See [CONFIGURATION.md](CONFIGURATION.md).
+Both tools re-read the ticket on every call because attachment URLs are pre-signed and expire. Downloads never send Freshdesk credentials, only use HTTPS, only reach hosts in `FRESHDESK_ATTACHMENT_HOSTS` (checked again on every redirect; `attachment_url` values returned by the Freshdesk API may also use `amazonaws.com`, where older attachments are stored) and are capped by `FRESHDESK_MAX_ATTACHMENT_BYTES`. See [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Ticket Summary
 
