@@ -7,6 +7,7 @@ import {
   classifyByName,
   extractAny,
   HANDLING,
+  MIN_IMAGE_DIMENSION,
   NOT_ANALYSED,
   toSupportedImage,
   UNTRUSTED_NOTICE,
@@ -531,9 +532,9 @@ export function registerAttachmentTools(server: McpServer) {
         .int()
         .min(0)
         .optional()
-        .default(100)
+        .default(MIN_IMAGE_DIMENSION)
         .describe(
-          "Skip images whose width AND height are both below this many pixels (signatures, logos, icons). 0 disables the filter.",
+          `Skip images whose width AND height are both below this many pixels (signatures, logos, icons). 0 disables the filter. Default ${MIN_IMAGE_DIMENSION} (FRESHDESK_MIN_IMAGE_DIMENSION).`,
         ),
     },
     async ({

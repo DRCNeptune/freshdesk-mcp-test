@@ -467,10 +467,14 @@ class NapiCanvasFactory {
 const SCANNED_PAGE_CHARS = 25;
 
 /**
- * Images smaller than this on both sides (logos, icons, bullets) do not justify
- * rendering a page that already has text. Same rule as min_dimension for inline images.
+ * Images smaller than this on both sides (logos, icons, bullets) are ignored: a PDF
+ * page with text is not rendered for them, and it is the default min_dimension for
+ * inline images. FRESHDESK_MIN_IMAGE_DIMENSION=0 keeps every image.
  */
-const PDF_IMAGE_MIN_PX = 100;
+export const MIN_IMAGE_DIMENSION = (() => {
+  const v = Number.parseInt(process.env.FRESHDESK_MIN_IMAGE_DIMENSION ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : 100;
+})();
 
 interface PdfTextItem {
   str?: string;
@@ -555,8 +559,12 @@ async function countSignificantImages(
         // Object not resolved: unknown size, ignore.
       }
     }
-    if (w === undefined || h === undefined) continue;
-    if (w < PDF_IMAGE_MIN_PX && h < PDF_IMAGE_MIN_PX) continue;
+    if (w === undefined || h === undefined) {
+      // Size unknown: only counted when every image is wanted.
+      if (MIN_IMAGE_DIMENSION === 0) count++;
+      continue;
+    }
+    if (w < MIN_IMAGE_DIMENSION && h < MIN_IMAGE_DIMENSION) continue;
     count++;
   }
   return count;
