@@ -28,7 +28,7 @@ const MAX_CONVERSATION_PAGES = 20;
  * The allowlist prevents SSRF through customer supplied <img> tags.
  */
 const ALLOWED_HOSTS = (
-  process.env.FRESHDESK_ATTACHMENT_HOSTS ?? "freshdesk.com,freshworks.com,amazonaws.com"
+  process.env.FRESHDESK_ATTACHMENT_HOSTS ?? "freshdesk.com,freshworks.com"
 )
   .split(",")
   .map((h) => h.trim().toLowerCase())
