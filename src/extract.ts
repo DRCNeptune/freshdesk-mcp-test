@@ -213,6 +213,8 @@ export function willAnalyse(kind: Kind): boolean {
   return !NOT_ANALYSED.has(kind) && !METADATA_ONLY.has(kind) && kindEnabled(kind);
 }
 
+export const ANIMATED_GIF_HANDLING = "animated GIF, treated as video: not analysed";
+
 export const DISABLED_HANDLING = "not analysed (type disabled by FRESHDESK_ATTACHMENT_TYPES)";
 
 /** Kinds the model will never be able to read: skip the download entirely. */
@@ -259,9 +261,46 @@ export function sniffSupportedImage(b: Buffer): string | null {
   return null;
 }
 
+/**
+ * True when a GIF has more than one frame. Walks the GIF block structure and stops at
+ * the second image descriptor. A malformed file returns false and is handled as a
+ * single image.
+ */
+export function isAnimatedGif(b: Buffer): boolean {
+  if (b.length < 13 || b.toString("ascii", 0, 3) !== "GIF") return false;
+  const skipSubBlocks = (p: number): number => {
+    while (p < b.length && b[p] !== 0) p += b[p] + 1;
+    return p + 1;
+  };
+  let p = 13;
+  const flags = b[10];
+  if (flags & 0x80) p += 3 * (1 << ((flags & 0x07) + 1)); // global color table
+  let frames = 0;
+  while (p < b.length) {
+    const block = b[p++];
+    if (block === 0x3b) break; // trailer
+    if (block === 0x21) {
+      p = skipSubBlocks(p + 1); // extension: label, then data sub-blocks
+    } else if (block === 0x2c) {
+      if (++frames > 1) return true;
+      if (p + 9 > b.length) break;
+      const local = b[p + 8];
+      p += 9;
+      if (local & 0x80) p += 3 * (1 << ((local & 0x07) + 1)); // local color table
+      p = skipSubBlocks(p + 1); // LZW minimum code size, then image data
+    } else {
+      break; // unexpected byte: stop, treat as a single image
+    }
+  }
+  return false;
+}
+
 /** Refines the kind from the actual bytes, so a renamed file is handled by what it really is. */
 export function classifyByBytes(b: Buffer, byName: Kind): Kind {
-  if (sniffSupportedImage(b)) return "image";
+  const image = sniffSupportedImage(b);
+  // Animated GIFs (screen recordings) are handled like videos: not analysed.
+  if (image === "image/gif" && isAnimatedGif(b)) return "video";
+  if (image) return "image";
   if (b.length >= 4 && b.toString("ascii", 0, 4) === "%PDF") return "pdf";
   if (b.length >= 2 && b.toString("ascii", 0, 2) === "BM" && b.length > 26) return "image-convert";
   if (b.length >= 4 && (b.readUInt32BE(0) === 0x49492a00 || b.readUInt32BE(0) === 0x4d4d002a))
@@ -485,145 +524,7 @@ interface Extracted {
 
 type Extractor = (b: Buffer, name: string, budget: Budget, depth: number) => Promise<Extracted>;
 
-/** Most frames returned for one animated GIF (also bounded by max_images). */
-const MAX_GIF_FRAMES = 8;
-
-export interface GifFrame {
-  png: Buffer;
-  /** Zero-based frame number in the GIF. */
-  index: number;
-  /** When the frame appears, in milliseconds from the start. */
-  at: number;
-  total: number;
-  durationMs: number;
-}
-
-/**
- * Rebuilds the frames of an animated GIF (respecting partial frames, transparency
- * and disposal) and returns up to maxFrames spread evenly over the animation time,
- * so states shown for longer are more likely to be picked. Null when not animated.
- */
-export async function gifFrames(b: Buffer, maxFrames: number): Promise<GifFrame[] | null> {
-  if (maxFrames <= 0) return null;
-  const { GifReader } = await import("omggif");
-  const reader = new GifReader(new Uint8Array(b));
-  const total = reader.numFrames();
-  if (total <= 1) return null;
-  const { width, height } = reader;
-
-  // Timeline. GIF delays are in centiseconds; 0 is shown by browsers as 100 ms.
-  const starts: number[] = [];
-  let t = 0;
-  for (let i = 0; i < total; i++) {
-    starts.push(t);
-    const delay = reader.frameInfo(i).delay;
-    t += (delay > 1 ? delay : 10) * 10;
-  }
-  const durationMs = t;
-
-  const count = Math.min(maxFrames, total);
-  const wanted = new Set<number>();
-  if (count >= total) {
-    for (let i = 0; i < total; i++) wanted.add(i);
-  } else {
-    // Always keep the first state, the final state and the frame shown longest
-    // (often the error message in a screen recording).
-    let longest = 0;
-    for (let i = 1; i < total; i++)
-      if (reader.frameInfo(i).delay > reader.frameInfo(longest).delay) longest = i;
-    const keep = [0, total - 1, longest].slice(0, count);
-    for (const i of keep) wanted.add(i);
-    // Then sample the timeline, so states shown for longer are more likely picked.
-    for (let k = 0; k < count && wanted.size < count; k++) {
-      const target = ((k + 0.5) * durationMs) / count;
-      let idx = 0;
-      for (let i = 0; i < total; i++) if (starts[i] <= target) idx = i;
-      wanted.add(idx);
-    }
-    // Fill any remaining slots with the frames farthest from those already picked.
-    while (wanted.size < count) {
-      let best = -1;
-      let bestGap = -1;
-      for (let i = 0; i < total; i++) {
-        if (wanted.has(i)) continue;
-        let gap = Number.POSITIVE_INFINITY;
-        for (const w of wanted) gap = Math.min(gap, Math.abs(i - w));
-        if (gap > bestGap) {
-          bestGap = gap;
-          best = i;
-        }
-      }
-      wanted.add(best);
-    }
-  }
-
-  const { Jimp } = await import("jimp");
-  const canvas = new Uint8Array(width * height * 4);
-  let saved: Uint8Array | null = null;
-  let prev: ReturnType<typeof reader.frameInfo> | null = null;
-  const last = Math.max(...wanted);
-  const frames: GifFrame[] = [];
-  for (let i = 0; i <= last; i++) {
-    const info = reader.frameInfo(i);
-    if (prev) {
-      if (prev.disposal === 2) {
-        // Restore to background: clear the previous frame's area.
-        for (let y = prev.y; y < prev.y + prev.height; y++)
-          canvas.fill(0, (y * width + prev.x) * 4, (y * width + prev.x + prev.width) * 4);
-      } else if (prev.disposal === 3 && saved) {
-        canvas.set(saved); // restore to previous
-      }
-    }
-    saved = info.disposal === 3 ? canvas.slice() : null;
-    reader.decodeAndBlitFrameRGBA(i, canvas);
-    prev = info;
-    if (!wanted.has(i)) continue;
-    // Flatten transparency onto white so the frame reads like it does on screen.
-    const rgba = Buffer.from(canvas);
-    for (let p = 0; p < rgba.length; p += 4) {
-      const a = rgba[p + 3] / 255;
-      rgba[p] = Math.round(rgba[p] * a + 255 * (1 - a));
-      rgba[p + 1] = Math.round(rgba[p + 1] * a + 255 * (1 - a));
-      rgba[p + 2] = Math.round(rgba[p + 2] * a + 255 * (1 - a));
-      rgba[p + 3] = 255;
-    }
-    const png = await new Jimp({ width, height, data: rgba }).getBuffer("image/png");
-    frames.push({ png, index: i, at: starts[i], total, durationMs });
-  }
-  return frames;
-}
-
-const seconds = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
-
 const extractImage: Extractor = async (b, name, budget) => {
-  if (sniffSupportedImage(b) === "image/gif") {
-    let frames: GifFrame[] | null = null;
-    try {
-      frames = await gifFrames(b, Math.min(MAX_GIF_FRAMES, budget.images));
-    } catch {
-      frames = null; // malformed animation: fall back to a single image
-    }
-    if (frames?.length) {
-      const content: Content[] = [
-        textBlock(
-          `Animated GIF: ${name}, ${frames[0].total} frames over ${seconds(frames[0].durationMs)}. ${frames.length} frame(s) shown in order:`,
-        ),
-      ];
-      for (const f of frames) {
-        if (!budget.takeImage()) break;
-        const img = (await toSupportedImage(f.png)) ?? { data: f.png, mimeType: "image/png" };
-        content.push(textBlock(`Frame ${f.index + 1} of ${f.total}, at ${seconds(f.at)}`), {
-          type: "image",
-          data: img.data.toString("base64"),
-          mimeType: img.mimeType,
-        });
-      }
-      const shown = content.filter((c) => c.type === "image").length;
-      const notes = [`animated GIF: ${shown} of ${frames[0].total} frames returned`];
-      if (shown < frames[0].total) budget.truncated = true;
-      return { kind: "image", content, notes };
-    }
-  }
   if (!budget.takeImage())
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
@@ -1402,6 +1303,8 @@ export async function extractAny(
   const byName = classifyByName(name, contentType);
   const kind = classifyByBytes(b, byName);
   if (!kindEnabled(kind)) return { kind, content: [], notes: [DISABLED_HANDLING] };
+  if (kind === "video" && sniffSupportedImage(b) === "image/gif")
+    return { kind, content: [], notes: [ANIMATED_GIF_HANDLING] };
   const fn = EXTRACTORS[kind];
   if (!fn) return { kind, content: [], notes: [HANDLING[kind]] };
   try {

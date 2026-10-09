@@ -1,7 +1,7 @@
 {
   "name": "freshdesk-mcp",
   "version": "1.1.1",
-  "description": "MCP server for Freshdesk (TypeScript) \u2014 supports stdio and Streamable HTTP transports",
+  "description": "MCP server for Freshdesk (TypeScript) — supports stdio and Streamable HTTP transports",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -58,7 +58,6 @@
     "heic-convert": "2.1.0",
     "jimp": "1.6.1",
     "mammoth": "1.13.0",
-    "omggif": "1.0.10",
     "papaparse": "5.5.3",
     "pdfjs-dist": "4.4.168",
     "postal-mime": "2.4.4",
@@ -68,7 +67,6 @@
     "@biomejs/biome": "^2.4.16",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.5",
-    "@types/omggif": "1.0.5",
     "@types/papaparse": "^5.5.2",
     "typescript": "^5.7.2"
   },

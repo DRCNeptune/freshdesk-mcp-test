@@ -3,13 +3,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
+  ANIMATED_GIF_HANDLING,
   Budget,
   classifyByName,
   DISABLED_HANDLING,
   extractAny,
-  type GifFrame,
-  gifFrames,
   HANDLING,
+  isAnimatedGif,
   kindEnabled,
   MIN_IMAGE_DIMENSION,
   toSupportedImage,
@@ -674,14 +674,10 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
 
-        // Animated GIFs (screen recordings) are returned as a sequence of frames.
-        let frames: GifFrame[] | null = null;
-        if (mime === "image/gif") {
-          try {
-            frames = await gifFrames(bytes, Math.min(8, max_images - imageBlocks));
-          } catch {
-            frames = null;
-          }
+        // Animated GIFs (screen recordings) are handled like videos: not analysed.
+        if (mime === "image/gif" && isAnimatedGif(bytes)) {
+          skip(ANIMATED_GIF_HANDLING);
+          continue;
         }
 
         // Shrink very large screenshots so they fit the model's image limits.
@@ -710,32 +706,6 @@ export function registerAttachmentTools(server: McpServer) {
           height: size?.height ?? null,
         };
         const label = `Image ${index}: ${s.origin}${s.conversation_id ? ` (conversation ${s.conversation_id})` : ""}${s.created_at ? `, ${s.created_at}` : ""}`;
-        if (frames?.length) {
-          returned.push({
-            ...info,
-            animated: true,
-            total_frames: frames[0].total,
-            frames_returned: frames.length,
-          });
-          images.push({
-            type: "text",
-            text: `${label}. Animated GIF, ${frames[0].total} frames over ${(frames[0].durationMs / 1000).toFixed(1)} s, ${frames.length} frame(s) shown in order:`,
-          });
-          for (const f of frames) {
-            const img = (await toSupportedImage(f.png)) ?? { data: f.png, mimeType: "image/png" };
-            images.push({
-              type: "text",
-              text: `Frame ${f.index + 1} of ${f.total}, at ${(f.at / 1000).toFixed(1)} s`,
-            });
-            images.push({
-              type: "image",
-              data: img.data.toString("base64"),
-              mimeType: img.mimeType,
-            });
-            imageBlocks++;
-          }
-          continue;
-        }
         returned.push(info);
         images.push({ type: "text", text: label });
         images.push({ type: "image", data: bytes.toString("base64"), mimeType: mime });
