@@ -2,6 +2,15 @@ import { createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import {
+  Budget,
+  classifyByName,
+  extractAny,
+  HANDLING,
+  NOT_ANALYSED,
+  toSupportedImage,
+  UNTRUSTED_NOTICE,
+} from "../extract.js";
 import { errorPayload, type FreshdeskResult, fd, parseLinkHeader } from "../freshdesk.js";
 import { text, tool } from "../util.js";
 
@@ -15,7 +24,7 @@ function envInt(name: string, fallback: number): number {
 }
 
 /** Per file download limit. */
-const MAX_FILE_BYTES = envInt("FRESHDESK_MAX_ATTACHMENT_BYTES", 5 * 1024 * 1024);
+const MAX_FILE_BYTES = envInt("FRESHDESK_MAX_ATTACHMENT_BYTES", 25 * 1024 * 1024);
 /** Total bytes returned by a single get_ticket_inline_images call. */
 const MAX_TOTAL_BYTES = envInt("FRESHDESK_MAX_TOTAL_ATTACHMENT_BYTES", 20 * 1024 * 1024);
 const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -45,6 +54,8 @@ interface FdAttachment {
   content_type?: string;
   size?: number;
   attachment_url?: string;
+  created_at?: string;
+  scan_state?: number;
 }
 
 interface FdConversation {
@@ -95,6 +106,32 @@ async function fetchAllConversations(
     page = parseLinkHeader(res.headers.get("link")).next;
   }
   return { ok: true, conversations };
+}
+
+type AttachmentHit = { att: FdAttachment; origin: string; conversation_id?: number };
+
+/** All attachments on a ticket and its conversations, plus a count of inline images. */
+async function collectAttachments(
+  ticketId: number,
+): Promise<
+  { ok: true; items: AttachmentHit[]; inlineImages: number } | { ok: false; error: unknown }
+> {
+  const t = await fetchTicket(ticketId);
+  if (!t.ok) return { ok: false, error: errorPayload("Failed to fetch ticket", t.res) };
+  const items: AttachmentHit[] = (t.ticket.attachments ?? []).map((att) => ({
+    att,
+    origin: "ticket description",
+  }));
+  let inlineImages = extractImgSrcs(t.ticket.description).length;
+  const conv = await fetchAllConversations(ticketId);
+  if (!conv.ok)
+    return { ok: false, error: errorPayload("Failed to fetch conversations", conv.res) };
+  for (const c of conv.conversations) {
+    inlineImages += extractImgSrcs(c.body).length;
+    for (const att of c.attachments ?? [])
+      items.push({ att, origin: conversationOrigin(c), conversation_id: c.id });
+  }
+  return { ok: true, items, inlineImages };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -223,37 +260,6 @@ function sniffImageType(b: Buffer): string | null {
   return null;
 }
 
-/** Image formats that MCP clients and the model can display. */
-const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-
-/** Best-effort file type detection from magic bytes, used to label files we cannot return. */
-function sniffFileType(b: Buffer): string | null {
-  const img = sniffImageType(b);
-  if (img) return img;
-  if (b.length >= 4 && b.toString("ascii", 0, 4) === "%PDF") return "application/pdf";
-  if (b.length >= 4 && b.readUInt32BE(0) === 0x504b0304) return "application/zip";
-  if (b.length >= 2 && b.toString("ascii", 0, 2) === "BM") return "image/bmp";
-  if (b.length >= 4 && (b.readUInt32BE(0) === 0x49492a00 || b.readUInt32BE(0) === 0x4d4d002a))
-    return "image/tiff";
-  if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
-    const brand = b.toString("ascii", 8, 12);
-    if (/^(heic|heix|mif1|msf1)$/.test(brand)) return "image/heic";
-    if (brand.startsWith("qt")) return "video/quicktime";
-    return "video/mp4";
-  }
-  if (b.length >= 3 && b[0] === 0x1f && b[1] === 0x8b) return "application/gzip";
-  if (b.length >= 6 && b.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])))
-    return "application/x-7z-compressed";
-  if (b.length >= 4 && b.toString("ascii", 0, 4) === "Rar!") return "application/vnd.rar";
-  if (b.length >= 8 && b.readUInt32BE(0) === 0xd0cf11e0) return "application/x-ole-storage";
-  return null;
-}
-
-/** True when the buffer looks like binary data (NUL bytes in the first 8 KB). */
-function looksBinary(b: Buffer): boolean {
-  return b.subarray(0, 8192).includes(0);
-}
-
 /** Reads width and height from the image header. Returns null when unknown. */
 function imageSize(b: Buffer, mime: string): { width: number; height: number } | null {
   try {
@@ -336,117 +342,64 @@ function conversationOrigin(c: FdConversation): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Text helpers                                                               */
-/* -------------------------------------------------------------------------- */
-
-const TEXT_EXTENSIONS = new Set([
-  "txt",
-  "log",
-  "json",
-  "xml",
-  "csv",
-  "tsv",
-  "yaml",
-  "yml",
-  "md",
-  "ini",
-  "conf",
-  "cfg",
-  "properties",
-  "env",
-  "html",
-  "htm",
-  "js",
-  "ts",
-  "sql",
-  "sh",
-  "har",
-]);
-
-const TEXT_CONTENT_TYPES = new Set([
-  "application/json",
-  "application/xml",
-  "application/yaml",
-  "application/x-yaml",
-  "application/javascript",
-  "application/x-sh",
-  "application/sql",
-  "application/x-ndjson",
-  "application/har+json",
-]);
-
-/** Extensions of files the model cannot read directly (documents, archives, media, binaries). */
-const NON_READABLE_EXTENSIONS = new Set([
-  "pdf",
-  "doc",
-  "docx",
-  "xls",
-  "xlsx",
-  "ppt",
-  "pptx",
-  "odt",
-  "ods",
-  "odp",
-  "rtf",
-  "zip",
-  "rar",
-  "7z",
-  "gz",
-  "tgz",
-  "tar",
-  "bz2",
-  "xz",
-  "mp4",
-  "mov",
-  "avi",
-  "mkv",
-  "webm",
-  "wmv",
-  "m4v",
-  "mp3",
-  "wav",
-  "m4a",
-  "ogg",
-  "exe",
-  "dll",
-  "msi",
-  "dmg",
-  "apk",
-  "ipa",
-  "jar",
-  "bin",
-  "iso",
-  "bmp",
-  "tif",
-  "tiff",
-  "heic",
-  "heif",
-  "psd",
-  "ai",
-  "eps",
-]);
-
-function extension(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
-}
-
-function isTextLike(contentType: string, name: string): boolean {
-  const ct = contentType.toLowerCase();
-  if (ct.startsWith("text/")) return true;
-  if (TEXT_CONTENT_TYPES.has(ct) || ct.endsWith("+json")) return true;
-  return TEXT_EXTENSIONS.has(extension(name));
-}
-
-/* -------------------------------------------------------------------------- */
 /* Tools                                                                      */
 /* -------------------------------------------------------------------------- */
 
 export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
+    "list_ticket_attachments",
+    "List every file attached to one or more tickets (description and all conversations) without downloading them: id, name, type, size, origin and how get_ticket_attachment will handle it. Videos, audio and executables are flagged as not analysed. Also counts inline images pasted in message bodies. Use name_contains to find a file across several tickets.",
+    {
+      ticket_ids: z.array(z.number().int()).min(1).max(25),
+      name_contains: z
+        .string()
+        .optional()
+        .describe("Only return attachments whose file name contains this text (case-insensitive)."),
+    },
+    async ({ ticket_ids, name_contains }): Promise<CallToolResult> => {
+      const filter = name_contains?.toLowerCase();
+      const results = [];
+      for (const ticket_id of ticket_ids) {
+        const found = await collectAttachments(ticket_id);
+        if (!found.ok) {
+          results.push({ ticket_id, error: found.error });
+          continue;
+        }
+        const attachments = found.items
+          .filter((c) => !filter || (c.att.name ?? "").toLowerCase().includes(filter))
+          .map((c) => {
+            const kind = classifyByName(c.att.name ?? "", c.att.content_type ?? "");
+            return {
+              id: c.att.id,
+              name: c.att.name,
+              content_type: c.att.content_type,
+              size: c.att.size,
+              created_at: c.att.created_at,
+              origin: c.origin,
+              conversation_id: c.conversation_id ?? null,
+              handling: HANDLING[kind],
+              analysed: !NOT_ANALYSED.has(kind),
+            };
+          });
+        const counts: Record<string, number> = {};
+        for (const a of attachments) counts[a.handling] = (counts[a.handling] ?? 0) + 1;
+        results.push({
+          ticket_id,
+          attachment_count: attachments.length,
+          by_handling: counts,
+          inline_image_count: filter ? undefined : found.inlineImages,
+          attachments,
+        });
+      }
+      return text(ticket_ids.length === 1 ? results[0] : { tickets: results });
+    },
+  );
+
+  tool(
+    server,
     "get_ticket_attachment",
-    "Read a file attachment from a ticket or any of its conversations. PNG, JPEG, GIF and WebP images are returned as image content and text files (log, txt, json, xml, csv, yaml, har, ...) as text. Other files (PDF, Office documents, archives, video, other image formats) cannot be read by the model: the tool returns their metadata and detected type instead, unless include_raw is true. Attachment ids come from get_ticket or get_ticket_conversation.",
+    "Read a file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/GIF/WebP, other formats converted, scanned PDF pages rendered). ZIP archives are listed and their files processed with the same rules. Videos, audio and executables are not downloaded. Large outputs are truncated with a clear marker. Attachment ids come from list_ticket_attachments.",
     {
       ticket_id: z.number().int(),
       attachment_id: z.number().int(),
@@ -454,92 +407,80 @@ export function registerAttachmentTools(server: McpServer) {
         .number()
         .int()
         .min(1000)
+        .max(500_000)
         .optional()
-        .default(100_000)
-        .describe("Text files longer than this are truncated (default 100000 characters)."),
-      include_raw: z
+        .default(60_000)
+        .describe("Maximum characters of extracted text returned (default 60000)."),
+      max_pages: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .optional()
+        .default(5)
+        .describe("Maximum scanned PDF pages rendered as images (default 5)."),
+      max_images: z
+        .number()
+        .int()
+        .min(0)
+        .max(20)
+        .optional()
+        .default(10)
+        .describe(
+          "Maximum images returned in total, including PDF pages and images inside documents or archives (default 10).",
+        ),
+      har_raw: z
         .boolean()
         .optional()
         .default(false)
-        .describe(
-          "Return files that are not text or a supported image as an embedded base64 resource. Only useful for clients that can handle binary resources (default false).",
-        ),
+        .describe("For HAR files, return the raw JSON instead of the request summary."),
     },
-    async ({ ticket_id, attachment_id, max_text_chars, include_raw }): Promise<CallToolResult> => {
+    async ({
+      ticket_id,
+      attachment_id,
+      max_text_chars,
+      max_pages,
+      max_images,
+      har_raw,
+    }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
-      const t = await fetchTicket(ticket_id);
-      if (!t.ok) return text(errorPayload("Failed to fetch ticket", t.res));
-
-      const candidates: { att: FdAttachment; origin: string; conversation_id?: number }[] = (
-        t.ticket.attachments ?? []
-      ).map((att) => ({ att, origin: "ticket" }));
-
-      let found = candidates.find((c) => c.att.id === attachment_id);
-      if (!found) {
-        const conv = await fetchAllConversations(ticket_id);
-        if (!conv.ok) return text(errorPayload("Failed to fetch conversations", conv.res));
-        for (const c of conv.conversations) {
-          for (const att of c.attachments ?? []) {
-            candidates.push({ att, origin: conversationOrigin(c), conversation_id: c.id });
-          }
-        }
-        found = candidates.find((c) => c.att.id === attachment_id);
-      }
-
-      if (!found) {
+      const found = await collectAttachments(ticket_id);
+      if (!found.ok) return text({ error: found.error });
+      const hit = found.items.find((c) => c.att.id === attachment_id);
+      if (!hit) {
         return text({
           error: `Attachment ${attachment_id} not found on ticket ${ticket_id}`,
-          available_attachments: candidates.map((c) => ({
+          available_attachments: found.items.map((c) => ({
             id: c.att.id,
             name: c.att.name,
-            content_type: c.att.content_type,
-            size: c.att.size,
             origin: c.origin,
-            conversation_id: c.conversation_id,
           })),
         });
       }
 
-      const { att } = found;
+      const { att } = hit;
       const name = att.name ?? `attachment-${att.id}`;
+      const kindByName = classifyByName(name, att.content_type ?? "");
       const meta = {
         ticket_id,
         attachment_id: att.id,
         name,
         content_type: att.content_type ?? null,
         size: att.size ?? null,
-        origin: found.origin,
-        conversation_id: found.conversation_id ?? null,
+        origin: hit.origin,
+        conversation_id: hit.conversation_id ?? null,
+        scan_state: att.scan_state ?? null,
       };
 
-      if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
-
-      const ext = extension(name);
-      const declaredType = (att.content_type ?? "application/octet-stream")
-        .split(";")[0]
-        .trim()
-        .toLowerCase();
-      const notReadable = (detectedType: string | null) =>
-        text({
+      if (NOT_ANALYSED.has(kindByName)) {
+        return text({
           ...meta,
-          detected_type: detectedType ?? declaredType,
-          readable: false,
-          reason:
-            "This file type cannot be read by the model. Only text files and PNG, JPEG, GIF or WebP images are returned as content.",
-          hint: "Pass include_raw: true to receive the file as a base64 resource if your client can handle binary files.",
+          handling: HANDLING[kindByName],
+          analysed: false,
+          reason: "This file type is not analysed. It was not downloaded.",
         });
-
-      // Skip the download entirely for types we would not return anyway.
-      const declaredNonReadable =
-        NON_READABLE_EXTENSIONS.has(ext) ||
-        /^(video|audio)\//.test(declaredType) ||
-        declaredType === "application/pdf" ||
-        declaredType.includes("officedocument") ||
-        declaredType.includes("msword") ||
-        declaredType.includes("ms-excel") ||
-        declaredType.includes("zip");
-      if (declaredNonReadable && !include_raw) return notReadable(null);
-
+      }
+      if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
       if (att.size && att.size > MAX_FILE_BYTES) {
         return text({
           ...meta,
@@ -551,58 +492,27 @@ export function registerAttachmentTools(server: McpServer) {
       const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
       if (!dl.ok) return text({ ...meta, error: `Download failed: ${dl.reason}` });
 
-      const detected = sniffFileType(dl.bytes);
-      const header: Content = {
-        type: "text",
-        text: JSON.stringify(
-          { ...meta, detected_type: detected ?? declaredType, downloaded_bytes: dl.bytes.length },
-          null,
-          2,
-        ),
+      const budget = new Budget({
+        maxTextChars: max_text_chars,
+        maxPages: max_pages,
+        maxImages: max_images,
+        harRaw: har_raw,
+      });
+      const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
+      const header = {
+        ...meta,
+        downloaded_bytes: dl.bytes.length,
+        detected_kind: out.kind,
+        handling: HANDLING[out.kind],
+        truncated: budget.truncated,
+        notes: out.notes,
       };
-
-      if (detected && SUPPORTED_IMAGE_TYPES.has(detected)) {
-        return {
-          content: [
-            header,
-            { type: "image", data: dl.bytes.toString("base64"), mimeType: detected },
-          ],
-        };
-      }
-
-      const textCandidate =
-        !detected &&
-        !looksBinary(dl.bytes) &&
-        (isTextLike(declaredType, name) || declaredType === "application/octet-stream");
-      if (textCandidate) {
-        const body = dl.bytes.toString("utf8");
-        const truncated = body.length > max_text_chars;
-        return {
-          content: [
-            header,
-            {
-              type: "text",
-              text: truncated
-                ? `${body.slice(0, max_text_chars)}\n\n[truncated: showing ${max_text_chars} of ${body.length} characters]`
-                : body,
-            },
-          ],
-        };
-      }
-
-      if (!include_raw) return notReadable(detected);
-
+      if (out.content.length === 0) return text({ ...header, analysed: false });
       return {
         content: [
-          header,
-          {
-            type: "resource",
-            resource: {
-              uri: `freshdesk://tickets/${ticket_id}/attachments/${att.id}/${encodeURIComponent(name)}`,
-              mimeType: detected ?? declaredType,
-              blob: dl.bytes.toString("base64"),
-            },
-          },
+          { type: "text", text: JSON.stringify(header, null, 2) },
+          { type: "text", text: UNTRUSTED_NOTICE },
+          ...out.content,
         ],
       };
     },
@@ -718,11 +628,16 @@ export function registerAttachmentTools(server: McpServer) {
           bytes = dl.bytes;
         }
 
-        const mime = sniffImageType(bytes);
+        let mime = sniffImageType(bytes);
         if (!mime) {
-          const other = sniffFileType(bytes);
-          skip(other ? `unsupported image format (${other})` : "not a supported image format");
-          continue;
+          // BMP, TIFF and HEIC are converted. Anything else is not an image we can show.
+          const converted = await toSupportedImage(bytes);
+          if (!converted) {
+            skip("not a supported image format");
+            continue;
+          }
+          bytes = converted.data;
+          mime = converted.mimeType;
         }
 
         const hash = createHash("sha256").update(bytes).digest("hex");
@@ -741,6 +656,13 @@ export function registerAttachmentTools(server: McpServer) {
         ) {
           skip(`too small (${size.width}x${size.height}), likely a logo or signature`);
           continue;
+        }
+
+        // Shrink very large screenshots so they fit the model's image limits.
+        const fitted = await toSupportedImage(bytes);
+        if (fitted) {
+          bytes = fitted.data;
+          mime = fitted.mimeType;
         }
 
         if (totalBytes + bytes.length > MAX_TOTAL_BYTES) {
