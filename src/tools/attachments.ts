@@ -539,12 +539,15 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
 
-        const urlKey = s.src.startsWith("data:") ? s.src.slice(0, 200) : displayUrl(s.src);
-        if (seenUrls.has(urlKey)) {
+        // Exact URL match only. Some tenants serve every inline image from the same
+        // path (for example attachment.freshdesk.com/inline/attachment?token=...),
+        // so the query string identifies the image. Re-signed copies of the same
+        // image are caught by the content hash below.
+        if (seenUrls.has(s.src)) {
           skip("duplicate (same image already returned)");
           continue;
         }
-        seenUrls.add(urlKey);
+        seenUrls.add(s.src);
 
         let bytes: Buffer;
         if (s.src.startsWith("data:")) {
