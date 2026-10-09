@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { errorPayload, fd, parseLinkHeader } from "../freshdesk.js";
+import { errorPayload, type FreshdeskResult, fd, parseLinkHeader } from "../freshdesk.js";
 import {
   ConversationUpdate,
   NoteCreate,
@@ -15,6 +15,88 @@ import {
   TicketUpdate,
 } from "../schemas/index.js";
 import { text, tool, validate } from "../util.js";
+
+/**
+ * Shared input schema for the conversation listing tools.
+ * Freshdesk returns conversations oldest first, 30 per page by default, so
+ * without paging long tickets silently lose their most recent messages.
+ */
+const conversationListParams = {
+  ticket_id: z.number().int(),
+  page: z.number().int().min(1).optional().default(1),
+  per_page: z.number().int().min(1).max(100).optional().default(100),
+  fetch_all: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe("Follow the Link header and return every page from `page` onwards (default true)."),
+  max_pages: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .default(20)
+    .describe("Safety cap on pages fetched when fetch_all is true (default 20)."),
+};
+
+interface ConversationListArgs {
+  page: number;
+  per_page: number;
+  fetch_all: boolean;
+  max_pages: number;
+}
+
+async function listConversations(path: string, args: ConversationListArgs, errorPrefix: string) {
+  const { page, per_page, fetch_all, max_pages } = args;
+
+  if (!fetch_all) {
+    const res = await fd.get(path, { page, per_page });
+    if (!res.ok) return text(errorPayload(errorPrefix, res));
+    const pagination = parseLinkHeader(res.headers.get("link"));
+    const conversations = Array.isArray(res.data) ? res.data : [];
+    return text({
+      conversations,
+      total_returned: conversations.length,
+      pagination: {
+        current_page: page,
+        next_page: pagination.next,
+        prev_page: pagination.prev,
+        per_page,
+      },
+    });
+  }
+
+  const conversations: unknown[] = [];
+  let current: number | null = page;
+  let pagesFetched = 0;
+
+  while (current !== null && pagesFetched < max_pages) {
+    const res: FreshdeskResult = await fd.get(path, { page: current, per_page });
+    if (!res.ok) {
+      // Report what we already have, so a late failure does not hide earlier pages.
+      return text({
+        ...errorPayload(errorPrefix, res),
+        failed_page: current,
+        conversations,
+        total_returned: conversations.length,
+        pages_fetched: pagesFetched,
+        truncated: true,
+      });
+    }
+    if (Array.isArray(res.data)) conversations.push(...res.data);
+    pagesFetched++;
+    current = parseLinkHeader(res.headers.get("link")).next;
+  }
+
+  return text({
+    conversations,
+    total_returned: conversations.length,
+    pages_fetched: pagesFetched,
+    truncated: current !== null,
+    next_page: current,
+  });
+}
 
 export function registerTicketTools(server: McpServer) {
   tool(server, "get_ticket_fields", "Get all ticket field definitions.", {}, async () => {
@@ -125,12 +207,14 @@ export function registerTicketTools(server: McpServer) {
   tool(
     server,
     "get_ticket_conversation",
-    "Get conversations for a ticket.",
-    { ticket_id: z.number().int() },
-    async ({ ticket_id }) => {
-      const res = await fd.get(`/tickets/${ticket_id}/conversations`);
-      return text(res.ok ? res.data : errorPayload("Failed to fetch conversation", res));
-    },
+    "Get conversations (replies and notes) for a ticket, oldest first. By default fetches every page so long threads are complete. Check `truncated` in the result.",
+    conversationListParams,
+    async ({ ticket_id, ...args }) =>
+      listConversations(
+        `/tickets/${ticket_id}/conversations`,
+        args,
+        "Failed to fetch conversation",
+      ),
   );
 
   tool(
@@ -369,12 +453,14 @@ export function registerTicketTools(server: McpServer) {
   tool(
     server,
     "list_archived_ticket_conversations",
-    "List conversations on an archived ticket.",
-    { ticket_id: z.number().int() },
-    async ({ ticket_id }) => {
-      const res = await fd.get(`/tickets/archived/${ticket_id}/conversations`);
-      return text(res.ok ? res.data : errorPayload("Failed to list archived conversations", res));
-    },
+    "List conversations on an archived ticket, oldest first. By default fetches every page so long threads are complete. Check `truncated` in the result.",
+    conversationListParams,
+    async ({ ticket_id, ...args }) =>
+      listConversations(
+        `/tickets/archived/${ticket_id}/conversations`,
+        args,
+        "Failed to list archived conversations",
+      ),
   );
 
   tool(

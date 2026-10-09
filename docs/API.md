@@ -65,7 +65,7 @@
 | `list_archived_tickets` | List archived tickets. | `page`, `per_page` | [↗](https://developers.freshdesk.com/api/#list_all_archived_tickets) |
 | `view_archived_ticket` | View an archived ticket. | `ticket_id` | [↗](https://developers.freshdesk.com/api/#view_an_archived_ticket) |
 | `delete_archived_ticket` | Permanently delete an archived ticket. | `ticket_id` | [↗](https://developers.freshdesk.com/api/#delete_an_archived_ticket) |
-| `list_archived_ticket_conversations` | List conversations on an archived ticket. | `ticket_id` | [↗](https://developers.freshdesk.com/api/#list_archived_ticket_conversations) |
+| `list_archived_ticket_conversations` | List conversations on an archived ticket, oldest first. Fetches all pages by default. | `ticket_id`, `page`, `per_page`, `fetch_all`, `max_pages` | [↗](https://developers.freshdesk.com/api/#list_archived_ticket_conversations) |
 | `merge_tickets` | Merge tickets into a primary. | `merge` | [↗](https://developers.freshdesk.com/api/#merge_tickets) |
 | `forward_ticket` | Forward a ticket. | `ticket_id`, `forward` | [↗](https://developers.freshdesk.com/api/#forward_a_ticket) |
 | `list_ticket_time_entries` | List time entries on a ticket. | `ticket_id` | [↗](https://developers.freshdesk.com/api/#list_all_time_entries) |
@@ -76,7 +76,7 @@
 
 | Tool | Description | Params | Docs |
 | --- | --- | --- | --- |
-| `get_ticket_conversation` | Get conversations for a ticket. | `ticket_id` | [↗](https://developers.freshdesk.com/api/#list_all_conversations_of_a_ticket) |
+| `get_ticket_conversation` | Get conversations for a ticket, oldest first. Fetches all pages by default. | `ticket_id`, `page`, `per_page`, `fetch_all`, `max_pages` | [↗](https://developers.freshdesk.com/api/#list_all_conversations_of_a_ticket) |
 | `create_ticket_reply` | Reply to a ticket. | `ticket_id`, `reply` | [↗](https://developers.freshdesk.com/api/#create_a_reply) |
 | `create_ticket_note` | Add a note to a ticket. | `ticket_id`, `note` | [↗](https://developers.freshdesk.com/api/#create_a_note) |
 | `update_ticket_conversation` | Update a conversation (reply or note). | `conversation_id`, `conversation` | [↗](https://developers.freshdesk.com/api/#update_a_conversation) |
