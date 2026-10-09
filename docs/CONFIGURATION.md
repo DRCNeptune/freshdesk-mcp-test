@@ -12,6 +12,9 @@ All configuration is via environment variables (read at process start) plus an o
 | `FRESHDESK_DOMAIN`   | yes      | —       | `*.freshdesk.com`                | Account host, no scheme, no trailing `/`. Example: `acme.freshdesk.com`.                                 |
 | `MCP_TRANSPORT`      | no       | `stdio` | `stdio`, `http`                  | Which MCP transport to expose.                                                                           |
 | `PORT`               | no       | `3000`  | int 1–65535                      | HTTP listen port. Only used when `MCP_TRANSPORT=http`.                                                   |
+| `FRESHDESK_ATTACHMENT_HOSTS` | no | `freshdesk.com,freshworks.com,amazonaws.com` | comma-separated hostnames | Hosts that `get_ticket_attachment` and `get_ticket_inline_images` may download from (subdomains included). `FRESHDESK_DOMAIN` is always added. Protects against SSRF through customer supplied `<img>` tags. |
+| `FRESHDESK_MAX_ATTACHMENT_BYTES` | no | `5242880` (5 MB) | int | Per file download limit for attachments and inline images. |
+| `FRESHDESK_MAX_TOTAL_ATTACHMENT_BYTES` | no | `20971520` (20 MB) | int | Total image bytes returned by a single `get_ticket_inline_images` call. |
 | `NODE_ENV`           | no       | unset   | `production`, `development`, ... | Standard Node convention. Only affects defaults in some downstream libs.                                 |
 
 A boot warning is emitted to `stderr` if `FRESHDESK_API_KEY` or `FRESHDESK_DOMAIN` is missing. The server still starts so MCP tool discovery works, but every Freshdesk call will fail.
