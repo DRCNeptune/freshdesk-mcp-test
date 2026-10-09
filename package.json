@@ -52,11 +52,10 @@
     "@kenjiuno/msgreader": "1.28.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@napi-rs/canvas": "0.1.65",
-    "exceljs": "4.4.0",
     "express": "^4.21.2",
-    "fflate": "0.8.2",
+    "fflate": "0.8.3",
     "heic-convert": "2.1.0",
-    "jimp": "1.6.0",
+    "jimp": "1.6.1",
     "mammoth": "1.13.0",
     "papaparse": "5.5.3",
     "pdfjs-dist": "4.4.168",
@@ -69,5 +68,9 @@
     "@types/node": "^22.10.5",
     "@types/papaparse": "^5.5.2",
     "typescript": "^5.7.2"
+  },
+  "overrides": {
+    "canvas": "npm:@favware/skip-dependency@1.2.2",
+    "argparse": "2.0.1"
   }
 }
