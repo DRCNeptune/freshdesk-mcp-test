@@ -14,6 +14,7 @@ import {
   registerTimeEntryTools,
 } from "./tools/admin_misc.js";
 import { registerAgentTools, registerGroupTools } from "./tools/agents.js";
+import { registerAttachmentTools } from "./tools/attachments.js";
 import { registerCannedTools } from "./tools/canned.js";
 import { registerCompanyTools } from "./tools/companies.js";
 import { registerContactTools } from "./tools/contacts.js";
@@ -39,6 +40,7 @@ export function buildServer(): McpServer {
   );
 
   registerTicketTools(server);
+  registerAttachmentTools(server);
   registerContactTools(server);
   registerAgentTools(server);
   registerGroupTools(server);

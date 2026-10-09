@@ -13,6 +13,7 @@
 
 - [Tickets](#tickets)
 - [Conversations](#conversations)
+- [Attachments](#attachments)
 - [Ticket Summary](#ticket-summary)
 - [Ticket Fields](#ticket-fields)
 - [Contacts](#contacts)
@@ -82,6 +83,15 @@
 | `update_ticket_conversation` | Update a conversation (reply or note). | `conversation_id`, `conversation` | [↗](https://developers.freshdesk.com/api/#update_a_conversation) |
 | `delete_conversation` | Delete a conversation (reply/note). | `conversation_id` | [↗](https://developers.freshdesk.com/api/#delete_a_conversation) |
 | `reply_to_forward` | Reply to a forwarded conversation. | `ticket_id`, `reply` | [↗](https://developers.freshdesk.com/api/#reply_to_a_forward) |
+
+## Attachments
+
+| Tool | Description | Params | Docs |
+| --- | --- | --- | --- |
+| `get_ticket_attachment` | Download a file attachment from a ticket or any of its conversations. Images return as MCP `image` content, text files (log, txt, json, xml, csv, yaml) as `text`, other files (PDF, zip, ...) as an embedded base64 `resource`. | `ticket_id`, `attachment_id`, `max_text_chars` | [↗](https://developers.freshdesk.com/api/#view_a_ticket) |
+| `get_ticket_inline_images` | Return images pasted inline into the ticket description and conversation bodies (not listed in `attachments`), as MCP `image` content labeled by origin, preceded by a JSON summary of found, returned and skipped images. | `ticket_id`, `include_conversations`, `max_images`, `min_dimension` | [↗](https://developers.freshdesk.com/api/#list_all_ticket_notes) |
+
+Both tools re-read the ticket on every call because attachment URLs are pre-signed and expire. Downloads never send Freshdesk credentials, only use HTTPS, only reach hosts in `FRESHDESK_ATTACHMENT_HOSTS` (checked again on every redirect) and are capped by `FRESHDESK_MAX_ATTACHMENT_BYTES`. See [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Ticket Summary
 
