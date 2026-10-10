@@ -14,6 +14,8 @@ import {
   registerTimeEntryTools,
 } from "./tools/admin_misc.js";
 import { registerAgentTools, registerGroupTools } from "./tools/agents.js";
+// Neptune DXP: summary of application exports (asx:abap XML) for get_ticket_attachment(s).
+import "./extract-neptune.js";
 import { registerAttachmentTools } from "./tools/attachments.js";
 import { registerCannedTools } from "./tools/canned.js";
 import { registerCompanyTools } from "./tools/companies.js";

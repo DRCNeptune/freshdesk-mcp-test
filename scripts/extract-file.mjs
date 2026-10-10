@@ -14,6 +14,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { Budget, extractAny } from "../dist/extract.js";
+import "../dist/extract-neptune.js"; // Neptune DXP export summaries (neptune branch)
 
 const args = process.argv.slice(2);
 const file = args.find((a, i) => !a.startsWith("--") && !args[i - 1]?.startsWith("--"));
