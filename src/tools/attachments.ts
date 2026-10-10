@@ -13,6 +13,7 @@ import {
   isAnimatedGif,
   type Kind,
   kindEnabled,
+  MAX_RESPONSE_BYTES,
   MIN_IMAGE_DIMENSION,
   mergeTextBlocks,
   toSupportedImage,
@@ -388,8 +389,31 @@ const PRIORITY: Partial<Record<Kind, number>> = {
   image: 5,
   "image-convert": 5,
 };
-/** Kinds that can return images, sharing the image budget fairly. */
-const IMAGE_CAPABLE: ReadonlySet<Kind> = new Set(["pdf", "docx", "zip", "image", "image-convert"]);
+/**
+ * Kinds that can return images and their weight when sharing the image budget:
+ * documents usually need several images (pages, screenshots), a loose image one.
+ */
+const IMAGE_WEIGHT: Partial<Record<Kind, number>> = {
+  pdf: 3,
+  docx: 3,
+  zip: 2,
+  image: 1,
+  "image-convert": 1,
+};
+const IMAGE_CAPABLE: ReadonlySet<Kind> = new Set(Object.keys(IMAGE_WEIGHT) as Kind[]);
+/** Which limits stopped content from being returned, in plain words for the model. */
+function limitedBy(budget: Budget, maxImages: number): string[] {
+  const out: string[] = [];
+  if (budget.sizeLimited)
+    out.push(
+      `response size (about ${Math.round(MAX_RESPONSE_BYTES / 1000)} KB, the client limit): images were recompressed or left out before max_images was reached`,
+    );
+  if (budget.images <= 0 && maxImages > 0) out.push(`max_images (${maxImages})`);
+  if (budget.chars <= 0) out.push("max_text_chars");
+  if (!out.length) out.push("max_pages or per-file limits");
+  return out;
+}
+
 const PARTIAL_STATUS =
   "partial: some content left out by the limits, read it with get_ticket_attachment";
 const SKIPPED_STATUS = "skipped: output limits reached, read it with get_ticket_attachment";
@@ -612,7 +636,7 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachments",
-    "Read several (or all) attachments of a ticket in one call, with the same rules as get_ticket_attachment and one output budget shared by all files. Starts with a JSON summary of every attachment (handling, status), then each file under a '===== Attachment N of M =====' marker. Files that cannot be analysed are not downloaded. Documents (PDF, Office, archives) are processed before loose images, and every file that can produce images gets a fair share of the image budget. The response is kept under the client size limit (images are recompressed if needed). Files are marked 'read', 'partial' (something was left out: read it again with get_ticket_attachment) or skipped.",
+    "Read several (or all) attachments of a ticket in one call, with the same rules as get_ticket_attachment and one output budget shared by all files. Starts with a JSON summary of every attachment (handling, status), then each file under a '===== Attachment N of M =====' marker. Files that cannot be analysed are not downloaded. Documents (PDF, Office, archives) are processed before loose images, and every file that can produce images gets a fair share of the image budget. The response is kept under the client size limit (about 900 KB), which usually limits images before max_images does: images are recompressed or left out, and 'limited_by' in the summary says which limit applied. Files are marked 'read', 'partial' (something was left out: read it again with get_ticket_attachment) or skipped.",
     {
       ticket_id: z.number().int(),
       attachment_ids: z
@@ -643,9 +667,9 @@ export function registerAttachmentTools(server: McpServer) {
       const order = selected
         .map((_, i) => i)
         .sort((a, c) => (PRIORITY[kinds[a]] ?? 4) - (PRIORITY[kinds[c]] ?? 4) || a - c);
-      let imageFilesLeft = order.filter(
-        (i) => IMAGE_CAPABLE.has(kinds[i]) && willAnalyse(kinds[i]),
-      ).length;
+      let weightLeft = order
+        .filter((i) => IMAGE_CAPABLE.has(kinds[i]) && willAnalyse(kinds[i]))
+        .reduce((n, i) => n + (IMAGE_WEIGHT[kinds[i]] ?? 1), 0);
 
       const summary: Record<string, unknown>[] = new Array(selected.length);
       const sections: Content[][] = new Array(selected.length);
@@ -700,7 +724,9 @@ export function registerAttachmentTools(server: McpServer) {
         return partial && !header.error;
       };
 
-      // Pass 1: every file, documents first, each with a fair share of the image budget.
+      // Pass 1: every file, documents first, each with a weighted share of the image
+      // budget. PDF pages whose only images are logos or signatures wait for pass 2.
+      budget.deferMinorPages = true;
       for (const i of order) {
         const kind = kinds[i];
         if (budget.chars <= 0 && budget.images <= 0 && willAnalyse(kind)) {
@@ -714,14 +740,15 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
         const capable = IMAGE_CAPABLE.has(kind) && willAnalyse(kind);
-        const shareImages = capable ? Math.ceil(budget.images / Math.max(1, imageFilesLeft)) : 0;
-        const shareBytes = capable
-          ? Math.floor(budget.imageBytes / Math.max(1, imageFilesLeft))
-          : 0;
-        if (capable) imageFilesLeft--;
+        const weight = capable ? (IMAGE_WEIGHT[kind] ?? 1) : 0;
+        const fraction = weight / Math.max(1, weightLeft);
+        const shareImages = capable ? Math.ceil(budget.images * fraction) : 0;
+        const shareBytes = capable ? Math.floor(budget.imageBytes * fraction) : 0;
+        weightLeft -= weight;
         if (await runFile(i, shareImages, shareBytes)) partialFiles.push(i);
       }
 
+      budget.deferMinorPages = false;
       // Pass 2: what other files did not use goes to the files left partial, in priority
       // order. Each one is read again with its first-pass usage given back, so it can
       // only get more. Files are not downloaded twice.
@@ -741,6 +768,7 @@ export function registerAttachmentTools(server: McpServer) {
         read: summary.filter((s) => s.status === "read").length,
         partial: summary.filter((s) => s.status === PARTIAL_STATUS).length,
         truncated: budget.truncated,
+        ...(budget.truncated ? { limited_by: limitedBy(budget, limits.max_images) } : {}),
         ...(missing.length ? { not_found: missing } : {}),
         files: summary,
       };

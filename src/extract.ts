@@ -415,6 +415,8 @@ export class Budget {
   truncated = false;
   /** Set when an image was dropped because the response size limit was reached. */
   sizeLimited = false;
+  /** When true, PDF text pages with only small images (logos, signatures) are not rendered. */
+  deferMinorPages = false;
   /** False when the "image" type is disabled: no image (page render, embedded image) is returned. */
   readonly imagesEnabled = kindEnabled("image");
   constructor(readonly opts: ExtractOptions) {
@@ -754,7 +756,7 @@ async function countSignificantImages(
   // biome-ignore lint/suspicious/noExplicitAny: pdf.js page proxy.
   page: any,
   ops: Record<string, number>,
-): Promise<number> {
+): Promise<{ count: number; largestShortSide: number }> {
   const imageOps = new Set([
     ops.paintImageXObject,
     ops.paintInlineImageXObject,
@@ -763,6 +765,7 @@ async function countSignificantImages(
   ]);
   const list = await page.getOperatorList();
   let count = 0;
+  let largestShortSide = 0;
   for (let i = 0; i < list.fnArray.length; i++) {
     if (!imageOps.has(list.fnArray[i])) continue;
     const args = list.argsArray[i] ?? [];
@@ -792,9 +795,17 @@ async function countSignificantImages(
     }
     if (w < MIN_IMAGE_DIMENSION && h < MIN_IMAGE_DIMENSION) continue;
     count++;
+    largestShortSide = Math.max(largestShortSide, Math.min(w, h));
   }
-  return count;
+  return { count, largestShortSide };
 }
+
+/**
+ * Images whose shorter side is below this (logos, signatures, banners, icons) are
+ * "minor": a page that has text and only minor images is rendered only when
+ * budget.deferMinorPages is off, i.e. in the second pass of a multi-file read.
+ */
+const MINOR_IMAGE_SHORT_SIDE = 120;
 
 const extractPdf: Extractor = async (b, _name, budget) => {
   const pdfjs = await loadPdfjs();
@@ -852,7 +863,10 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     const tc = await page.getTextContent();
     const pageText = joinPdfTextItems(tc.items as PdfTextItem[]);
     const scanned = pageText.length < SCANNED_PAGE_CHARS;
-    const images = scanned ? 0 : await countSignificantImages(page, pdfjs.OPS);
+    const found = scanned
+      ? { count: 0, largestShortSide: 0 }
+      : await countSignificantImages(page, pdfjs.OPS);
+    const images = found.count;
 
     if (!scanned && images === 0) {
       parts.push(`--- Page ${n} ---\n${pageText}`);
@@ -863,6 +877,13 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     if (scanned) scannedPages++;
     else imagePages++;
     const why = scanned ? "scanned page" : `page with ${images} image(s)`;
+    if (!scanned && budget.deferMinorPages && found.largestShortSide < MINOR_IMAGE_SHORT_SIDE) {
+      // Text page whose images look like logos or signatures: rendered later if room is left.
+      parts.push(`--- Page ${n} --- (${why}, small images only, not rendered yet)\n${pageText}`);
+      budget.truncated = true;
+      page.cleanup();
+      continue;
+    }
     if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
       parts.push(
         `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
@@ -1384,9 +1405,10 @@ const extractHar: Extractor = async (b, _name, budget) => {
     `## Failed requests (${failed.length})`,
     failed.length ? failedDetails.join("\n") : "None",
     "",
-    "## Slowest requests",
-    markdownTable([head, ...slow.map(row)]),
-    "",
+    // A small HAR is fully listed below, so a separate slowest table would only repeat it.
+    ...(entries.length > 25
+      ? ["## Slowest requests", markdownTable([head, ...slow.map(row)]), ""]
+      : []),
     "## All requests (chronological)",
     markdownTable([head, ...entries.map(row)]),
   ].join("\n");
