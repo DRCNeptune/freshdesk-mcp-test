@@ -403,6 +403,38 @@ export async function shrinkToFit(
   return null;
 }
 
+/** Largest image in "economy" mode (reading several files at once), in base64 characters. */
+const ECONOMY_IMAGE_B64 = 150_000;
+
+/**
+ * Cheaper encoding for documents read in bulk: JPEG instead of PNG, and greyscale
+ * when the image is (almost) black and white, as most scans and many screenshots
+ * are. Text stays legible. Returns null when it does not save anything.
+ */
+async function economize(data: Buffer): Promise<{ data: Buffer; mimeType: string } | null> {
+  const { Jimp } = await import("jimp");
+  let img: Awaited<ReturnType<typeof Jimp.read>>;
+  try {
+    img = await Jimp.read(data);
+  } catch {
+    return null;
+  }
+  const px = img.bitmap.data;
+  const step = Math.max(4, Math.floor(px.length / 4 / 20_000) * 4);
+  let colored = 0;
+  let samples = 0;
+  for (let i = 0; i < px.length; i += step) {
+    samples++;
+    const r = px[i];
+    const g = px[i + 1];
+    const b = px[i + 2];
+    if (Math.max(r, g, b) - Math.min(r, g, b) > 28) colored++;
+  }
+  if (colored / Math.max(1, samples) < 0.02) img.greyscale();
+  const out = await img.getBuffer("image/jpeg", { quality: 72 });
+  return out.length < data.length ? { data: out, mimeType: "image/jpeg" } : null;
+}
+
 /**
  * Shared limits for one tool call: characters of text, number of images and bytes
  * of image data, so nested contents and many files cannot exceed what clients accept.
@@ -417,6 +449,10 @@ export class Budget {
   sizeLimited = false;
   /** When true, PDF text pages with only small images (logos, signatures) are not rendered. */
   deferMinorPages = false;
+  /** Pages left unrendered because their only images were small. Not a truncation. */
+  minorDeferred = 0;
+  /** Cheaper image encoding, used when several files share one response. */
+  economy = false;
   /** False when the "image" type is disabled: no image (page render, embedded image) is returned. */
   readonly imagesEnabled = kindEnabled("image");
   constructor(readonly opts: ExtractOptions) {
@@ -460,8 +496,21 @@ export class Budget {
     data: Buffer,
     mimeType: string,
   ): Promise<{ data: Buffer; mimeType: string } | null> {
-    const fitted = await shrinkToFit(data, mimeType, Math.min(MAX_IMAGE_B64, this.imageBytes));
+    let cap = Math.min(MAX_IMAGE_B64, this.imageBytes);
+    if (this.economy) {
+      cap = Math.min(cap, ECONOMY_IMAGE_B64);
+      if (base64Length(data.length) > 40_000) {
+        const cheaper = await economize(data);
+        if (cheaper) {
+          data = cheaper.data;
+          mimeType = cheaper.mimeType;
+        }
+      }
+    }
+    const fitted = await shrinkToFit(data, mimeType, cap);
     if (!fitted) {
+      // The slot reserved by takeImage is given back: only the size was the problem.
+      this.images++;
       this.truncated = true;
       this.sizeLimited = true;
       return null;
@@ -879,8 +928,10 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     const why = scanned ? "scanned page" : `page with ${images} image(s)`;
     if (!scanned && budget.deferMinorPages && found.largestShortSide < MINOR_IMAGE_SHORT_SIDE) {
       // Text page whose images look like logos or signatures: rendered later if room is left.
-      parts.push(`--- Page ${n} --- (${why}, small images only, not rendered yet)\n${pageText}`);
-      budget.truncated = true;
+      parts.push(
+        `--- Page ${n} --- (its only images are small, likely a logo or signature: not rendered to save space)\n${pageText}`,
+      );
+      budget.minorDeferred++;
       page.cleanup();
       continue;
     }
@@ -931,7 +982,10 @@ const extractPdf: Extractor = async (b, _name, budget) => {
       ...content,
     ],
     notes,
-    handling: `PDF text (${doc.numPages} page(s)), ${rendered ? `${rendered} page(s) rendered as images` : "no page rendered"}`,
+    handling:
+      scannedPages > 0 && scannedPages === doc.numPages
+        ? `scanned PDF (${doc.numPages} page(s), no text layer), ${rendered} of ${doc.numPages} page(s) rendered as images`
+        : `PDF text (${doc.numPages - scannedPages} of ${doc.numPages} page(s) with text${scannedPages ? `, ${scannedPages} scanned` : ""}), ${rendered ? `${rendered} page(s) rendered as images` : "no page rendered"}`,
   };
 };
 
