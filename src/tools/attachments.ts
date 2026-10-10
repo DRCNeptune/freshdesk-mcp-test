@@ -113,6 +113,13 @@ async function fetchAllConversations(
   return { ok: true, conversations };
 }
 
+/** Whether a GIF is animated is only known after download, so the listing says so. */
+const GIF_LIST_HANDLING = "image if static; if animated, treated as video and not analysed";
+
+function isGifName(name: string, contentType: string): boolean {
+  return /\.gif$/i.test(name) || contentType.toLowerCase() === "image/gif";
+}
+
 type AttachmentHit = { att: FdAttachment; origin: string; conversation_id?: number };
 
 /** All attachments on a ticket and its conversations, plus a count of inline images. */
@@ -383,7 +390,11 @@ export function registerAttachmentTools(server: McpServer) {
               created_at: c.att.created_at,
               origin: c.origin,
               conversation_id: c.conversation_id ?? null,
-              handling: kindEnabled(kind) ? HANDLING[kind] : DISABLED_HANDLING,
+              handling: !kindEnabled(kind)
+                ? DISABLED_HANDLING
+                : isGifName(c.att.name ?? "", c.att.content_type ?? "")
+                  ? GIF_LIST_HANDLING
+                  : HANDLING[kind],
               analysed: willAnalyse(kind),
             };
           });
