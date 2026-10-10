@@ -12,6 +12,7 @@ import {
   isAnimatedGif,
   kindEnabled,
   MIN_IMAGE_DIMENSION,
+  mergeTextBlocks,
   toSupportedImage,
   UNTRUSTED_NOTICE,
   willAnalyse,
@@ -357,6 +358,120 @@ function conversationOrigin(c: FdConversation): string {
 /* Tools                                                                      */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* Reading one attachment (shared by get_ticket_attachment(s))                 */
+/* -------------------------------------------------------------------------- */
+
+const LIMIT_PARAMS = {
+  max_text_chars: z
+    .number()
+    .int()
+    .min(1000)
+    .max(500_000)
+    .optional()
+    .default(60_000)
+    .describe("Maximum characters of extracted text returned in total (default 60000)."),
+  max_pages: z
+    .number()
+    .int()
+    .min(1)
+    .max(20)
+    .optional()
+    .default(5)
+    .describe("Maximum PDF pages rendered as images in total (default 5)."),
+  max_images: z
+    .number()
+    .int()
+    .min(0)
+    .max(20)
+    .optional()
+    .default(10)
+    .describe(
+      "Maximum images returned in total, including PDF pages and images inside documents or archives (default 10).",
+    ),
+  har_raw: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("For HAR files, return the raw JSON instead of the request summary."),
+};
+
+function budgetFrom(l: {
+  max_text_chars: number;
+  max_pages: number;
+  max_images: number;
+  har_raw: boolean;
+}): Budget {
+  return new Budget({
+    maxTextChars: l.max_text_chars,
+    maxPages: l.max_pages,
+    maxImages: l.max_images,
+    harRaw: l.har_raw,
+  });
+}
+
+/**
+ * Downloads and extracts one attachment within the given budget. Never throws:
+ * skipped and failed files return a header explaining why and no content.
+ */
+async function readAttachment(
+  ticketId: number,
+  hit: AttachmentHit,
+  budget: Budget,
+): Promise<{ header: Record<string, unknown>; content: Content[] }> {
+  const { att } = hit;
+  const name = att.name ?? `attachment-${att.id}`;
+  const kindByName = classifyByName(name, att.content_type ?? "");
+  const meta = {
+    ticket_id: ticketId,
+    attachment_id: att.id,
+    name,
+    content_type: att.content_type ?? null,
+    size: att.size ?? null,
+    origin: hit.origin,
+    conversation_id: hit.conversation_id ?? null,
+    scan_state: att.scan_state ?? null,
+  };
+  const none = (extra: Record<string, unknown>) => ({ header: { ...meta, ...extra }, content: [] });
+
+  if (!kindEnabled(kindByName)) {
+    return none({
+      handling: DISABLED_HANDLING,
+      analysed: false,
+      reason: "This file type is disabled by the server configuration. It was not downloaded.",
+    });
+  }
+  if (!willAnalyse(kindByName)) {
+    return none({
+      handling: HANDLING[kindByName],
+      analysed: false,
+      reason: "This file type cannot be read. It was not downloaded.",
+    });
+  }
+  if (!att.attachment_url) return none({ error: "Attachment has no download URL" });
+  if (att.size && att.size > MAX_FILE_BYTES) {
+    return none({
+      error: `File too large (${att.size} bytes, limit ${MAX_FILE_BYTES}). Raise FRESHDESK_MAX_ATTACHMENT_BYTES to allow it.`,
+    });
+  }
+
+  // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
+  const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
+  if (!dl.ok) return none({ error: `Download failed: ${dl.reason}` });
+
+  const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
+  const header = {
+    ...meta,
+    downloaded_bytes: dl.bytes.length,
+    detected_kind: out.kind,
+    handling: out.handling ?? HANDLING[out.kind],
+    truncated: budget.truncated,
+    notes: out.notes,
+    ...(out.content.length ? {} : { analysed: false }),
+  };
+  return { header, content: out.content };
+}
+
 export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
@@ -415,50 +530,9 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachment",
-    "Read a file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/GIF/WebP, other formats converted, scanned PDF pages rendered). ZIP archives are listed and their files processed with the same rules. Videos, audio and executables are not downloaded. Large outputs are truncated with a clear marker. Attachment ids come from list_ticket_attachments.",
-    {
-      ticket_id: z.number().int(),
-      attachment_id: z.number().int(),
-      max_text_chars: z
-        .number()
-        .int()
-        .min(1000)
-        .max(500_000)
-        .optional()
-        .default(60_000)
-        .describe("Maximum characters of extracted text returned (default 60000)."),
-      max_pages: z
-        .number()
-        .int()
-        .min(1)
-        .max(20)
-        .optional()
-        .default(5)
-        .describe("Maximum scanned PDF pages rendered as images (default 5)."),
-      max_images: z
-        .number()
-        .int()
-        .min(0)
-        .max(20)
-        .optional()
-        .default(10)
-        .describe(
-          "Maximum images returned in total, including PDF pages and images inside documents or archives (default 10).",
-        ),
-      har_raw: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("For HAR files, return the raw JSON instead of the request summary."),
-    },
-    async ({
-      ticket_id,
-      attachment_id,
-      max_text_chars,
-      max_pages,
-      max_images,
-      har_raw,
-    }): Promise<CallToolResult> => {
+    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos, audio, executables and animated GIFs are not analysed. Large outputs are truncated with a clear marker. Attachment ids come from list_ticket_attachments. To read several attachments in one call, use get_ticket_attachments.",
+    { ticket_id: z.number().int(), attachment_id: z.number().int(), ...LIMIT_PARAMS },
+    async ({ ticket_id, attachment_id, ...limits }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
       const found = await collectAttachments(ticket_id);
       if (!found.ok) return text({ error: found.error });
@@ -473,71 +547,99 @@ export function registerAttachmentTools(server: McpServer) {
           })),
         });
       }
-
-      const { att } = hit;
-      const name = att.name ?? `attachment-${att.id}`;
-      const kindByName = classifyByName(name, att.content_type ?? "");
-      const meta = {
-        ticket_id,
-        attachment_id: att.id,
-        name,
-        content_type: att.content_type ?? null,
-        size: att.size ?? null,
-        origin: hit.origin,
-        conversation_id: hit.conversation_id ?? null,
-        scan_state: att.scan_state ?? null,
-      };
-
-      if (!willAnalyse(kindByName) && kindEnabled(kindByName)) {
-        return text({
-          ...meta,
-          handling: HANDLING[kindByName],
-          analysed: false,
-          reason: "This file type cannot be read. It was not downloaded.",
-        });
-      }
-      if (!kindEnabled(kindByName)) {
-        return text({
-          ...meta,
-          handling: DISABLED_HANDLING,
-          analysed: false,
-          reason: "This file type is disabled by the server configuration. It was not downloaded.",
-        });
-      }
-      if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
-      if (att.size && att.size > MAX_FILE_BYTES) {
-        return text({
-          ...meta,
-          error: `File too large (${att.size} bytes, limit ${MAX_FILE_BYTES}). Raise FRESHDESK_MAX_ATTACHMENT_BYTES to allow it.`,
-        });
-      }
-
-      // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
-      const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
-      if (!dl.ok) return text({ ...meta, error: `Download failed: ${dl.reason}` });
-
-      const budget = new Budget({
-        maxTextChars: max_text_chars,
-        maxPages: max_pages,
-        maxImages: max_images,
-        harRaw: har_raw,
-      });
-      const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
-      const header = {
-        ...meta,
-        downloaded_bytes: dl.bytes.length,
-        detected_kind: out.kind,
-        handling: HANDLING[out.kind],
-        truncated: budget.truncated,
-        notes: out.notes,
-      };
-      if (out.content.length === 0) return text({ ...header, analysed: false });
+      const budget = budgetFrom(limits);
+      const { header, content } = await readAttachment(ticket_id, hit, budget);
+      if (content.length === 0) return text(header);
       return {
-        content: [
+        content: mergeTextBlocks([
           { type: "text", text: JSON.stringify(header, null, 2) },
           { type: "text", text: UNTRUSTED_NOTICE },
-          ...out.content,
-        ],
+          ...content,
+        ]),
+      };
+    },
+  );
+
+  tool(
+    server,
+    "get_ticket_attachments",
+    "Read several (or all) attachments of a ticket in one call, with the same rules as get_ticket_attachment and one output budget shared by all files. Starts with a JSON summary of every attachment (handling, status), then each file under a '===== Attachment N of M =====' marker. Files that cannot be analysed are not downloaded. When the budget runs out, the remaining files are listed as skipped so they can be read individually.",
+    {
+      ticket_id: z.number().int(),
+      attachment_ids: z
+        .array(z.number().int())
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Attachments to read. Omit to read every attachment of the ticket."),
+      ...LIMIT_PARAMS,
+      max_text_chars: LIMIT_PARAMS.max_text_chars.default(100_000),
+    },
+    async ({ ticket_id, attachment_ids, ...limits }): Promise<CallToolResult> => {
+      const found = await collectAttachments(ticket_id);
+      if (!found.ok) return text({ error: found.error });
+      const missing = (attachment_ids ?? []).filter(
+        (id) => !found.items.some((c) => c.att.id === id),
+      );
+      const selected = attachment_ids
+        ? found.items.filter((c) => attachment_ids.includes(c.att.id))
+        : found.items;
+
+      const budget = budgetFrom(limits);
+      const summary: Record<string, unknown>[] = [];
+      const body: Content[] = [];
+      for (let i = 0; i < selected.length; i++) {
+        const hit = selected[i];
+        const exhausted = budget.chars <= 0 && budget.images <= 0;
+        const kind = classifyByName(hit.att.name ?? "", hit.att.content_type ?? "");
+        if (exhausted && willAnalyse(kind)) {
+          budget.truncated = true;
+          summary.push({
+            id: hit.att.id,
+            name: hit.att.name,
+            status: "skipped: output limits reached, read it with get_ticket_attachment",
+          });
+          continue;
+        }
+        const { header, content } = await readAttachment(ticket_id, hit, budget);
+        const firstNote = Array.isArray(header.notes) ? header.notes[0] : undefined;
+        const status = header.error
+          ? `error: ${header.error}`
+          : content.length
+            ? "read"
+            : String(header.reason ?? firstNote ?? "not analysed");
+        summary.push({
+          id: hit.att.id,
+          name: header.name,
+          origin: header.origin,
+          conversation_id: header.conversation_id,
+          handling: header.handling,
+          status,
+          ...(Array.isArray(header.notes) && header.notes.length ? { notes: header.notes } : {}),
+        });
+        if (content.length) {
+          body.push(
+            {
+              type: "text",
+              text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nHandling: ${header.handling}`,
+            },
+            ...content,
+          );
+        }
+      }
+      const overview = {
+        ticket_id,
+        attachments: selected.length,
+        read: summary.filter((s) => s.status === "read").length,
+        truncated: budget.truncated,
+        ...(missing.length ? { not_found: missing } : {}),
+        files: summary,
+      };
+      return {
+        content: mergeTextBlocks([
+          { type: "text", text: JSON.stringify(overview, null, 2) },
+          ...(body.length ? [{ type: "text" as const, text: UNTRUSTED_NOTICE }, ...body] : []),
+        ]),
       };
     },
   );
@@ -731,7 +833,12 @@ export function registerAttachmentTools(server: McpServer) {
         images: returned,
         skipped_details: skipped,
       };
-      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }, ...images] };
+      return {
+        content: mergeTextBlocks([
+          { type: "text", text: JSON.stringify(summary, null, 2) },
+          ...images,
+        ]),
+      };
     },
   );
 }
