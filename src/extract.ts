@@ -223,7 +223,7 @@ export const NOT_ANALYSED: ReadonlySet<Kind> = new Set(["video", "audio", "execu
 export const HANDLING: Record<Kind, string> = {
   image: "image",
   "image-convert": "image (converted to PNG/JPEG)",
-  pdf: "PDF text (scanned pages as images)",
+  pdf: "PDF text, pages with images or without text rendered as images",
   docx: "Word document as text",
   xlsx: "spreadsheet as tables",
   csv: "CSV as table",
@@ -516,10 +516,12 @@ export async function toSupportedImage(
 /* Extractors                                                                 */
 /* -------------------------------------------------------------------------- */
 
-interface Extracted {
+export interface Extracted {
   kind: Kind;
   content: Content[];
   notes: string[];
+  /** What the extractor actually did, e.g. "PDF text (3 pages), 1 page rendered as image". */
+  handling?: string;
 }
 
 type Extractor = (b: Buffer, name: string, budget: Budget, depth: number) => Promise<Extracted>;
@@ -536,6 +538,7 @@ const extractImage: Extractor = async (b, name, budget) => {
       { type: "image", data: img.data.toString("base64"), mimeType: img.mimeType },
     ],
     notes: img.note ? [img.note] : [],
+    handling: img.note ? `image (${img.note})` : "image",
   };
 };
 
@@ -799,6 +802,7 @@ const extractPdf: Extractor = async (b, _name, budget) => {
       ...content,
     ],
     notes,
+    handling: `PDF text (${doc.numPages} page(s)), ${rendered ? `${rendered} page(s) rendered as images` : "no page rendered"}`,
   };
 };
 
@@ -850,6 +854,7 @@ const extractDocx: Extractor = async (b, _name, budget) => {
     kind: "docx",
     content: [textBlock(budget.takeText(markdown.trim() || "(no text)")), ...images],
     notes,
+    handling: `Word document as Markdown${embedded.length ? `, ${images.length / 2} of ${embedded.length} embedded image(s) returned` : ""}`,
   };
 };
 
@@ -962,6 +967,7 @@ const extractXlsx: Extractor = async (b, _name, budget) => {
     kind: "xlsx",
     content: [textBlock(budget.takeText(parts.join("\n\n") || "(empty workbook)"))],
     notes: [],
+    handling: `spreadsheet, ${parts.length} sheet(s) as tables`,
   };
 };
 
@@ -983,10 +989,11 @@ const extractCsv: Extractor = async (b, name, budget) => {
       textBlock(budget.takeText(`${parsed.data.length} row(s)\n\n${markdownTable(rows)}${more}`)),
     ],
     notes: [],
+    handling: `CSV as table, ${parsed.data.length} row(s)`,
   };
 };
 
-function decodeXmlEntities(s: string): string {
+export function decodeXmlEntities(s: string): string {
   return s
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -1027,6 +1034,7 @@ const extractPptx: Extractor = async (b, _name, budget) => {
     kind: "pptx",
     content: [textBlock(budget.takeText(`${slides.length} slide(s)\n\n${parts.join("\n\n")}`))],
     notes: [],
+    handling: `${slides.length} slide(s) as text`,
   };
 };
 
@@ -1096,7 +1104,12 @@ const extractZip: Extractor = async (b, name, budget, depth) => {
     content.push(textBlock(`=== ${path} (${HANDLING[inner.kind]}) ===`), ...inner.content);
     if (inner.notes.length) content.push(textBlock(`Notes for ${path}: ${inner.notes.join("; ")}`));
   }
-  return { kind: "zip", content, notes };
+  return {
+    kind: "zip",
+    content,
+    notes,
+    handling: `archive, ${listing.length} file(s) listed, ${Object.keys(data).length} processed`,
+  };
 };
 
 const extractEml: Extractor = async (b, _name, budget) => {
@@ -1135,7 +1148,12 @@ const extractEml: Extractor = async (b, _name, budget) => {
   ]
     .filter((l, i) => l !== "" || i === 5)
     .join("\n");
-  return { kind: "eml", content: [textBlock(budget.takeText(text))], notes: [] };
+  return {
+    kind: "eml",
+    content: [textBlock(budget.takeText(text))],
+    notes: [],
+    handling: `email headers and body, ${attachments.length} attachment(s) listed`,
+  };
 };
 
 const extractMsg: Extractor = async (b, _name, budget) => {
@@ -1170,7 +1188,12 @@ const extractMsg: Extractor = async (b, _name, budget) => {
   ]
     .filter((l, idx) => l !== "" || idx === 4)
     .join("\n");
-  return { kind: "msg", content: [textBlock(budget.takeText(text))], notes: [] };
+  return {
+    kind: "msg",
+    content: [textBlock(budget.takeText(text))],
+    notes: [],
+    handling: `Outlook email headers and body, ${attachments.length} attachment(s) listed`,
+  };
 };
 
 interface HarEntry {
@@ -1189,7 +1212,12 @@ interface HarEntry {
 const extractHar: Extractor = async (b, _name, budget) => {
   const raw = decodeText(b);
   if (budget.opts.harRaw)
-    return { kind: "har", content: [textBlock(budget.takeText(raw))], notes: [] };
+    return {
+      kind: "har",
+      content: [textBlock(budget.takeText(raw))],
+      notes: [],
+      handling: "HAR raw JSON",
+    };
   let har: {
     log?: {
       entries?: HarEntry[];
@@ -1204,6 +1232,7 @@ const extractHar: Extractor = async (b, _name, budget) => {
       kind: "har",
       content: [textBlock(budget.takeText(raw))],
       notes: ["not valid JSON, returned as text"],
+      handling: "HAR file that is not valid JSON, returned as text",
     };
   }
   const entries = har.log?.entries ?? [];
@@ -1250,25 +1279,140 @@ const extractHar: Extractor = async (b, _name, budget) => {
     kind: "har",
     content: [textBlock(budget.takeText(text))],
     notes: ["pass har_raw: true for the full HAR JSON"],
+    handling: `HAR summary of ${entries.length} request(s), ${failed.length} failed`,
   };
 };
 
 const extractJson: Extractor = async (b, _name, budget) => {
   const raw = decodeText(b);
   let text = raw;
+  let valid = true;
   try {
     text = JSON.stringify(JSON.parse(raw), null, 2);
   } catch {
-    // Not strict JSON (JSON lines, comments): return as is.
+    valid = false; // Not strict JSON (JSON lines, comments): return as is.
   }
-  return { kind: "json", content: [textBlock(budget.takeText(text))], notes: [] };
+  return {
+    kind: "json",
+    content: [textBlock(budget.takeText(text))],
+    notes: [],
+    handling: valid ? "JSON, pretty printed" : "JSON-like text (not valid JSON), returned as is",
+  };
+};
+
+/** Larger XML is returned as is: indenting it would only make the truncated part longer. */
+const MAX_XML_PRETTY_CHARS = 5 * 1024 * 1024;
+
+/**
+ * Indents XML that arrives on one or a few very long lines (common for SAP and
+ * application exports). Elements holding only text stay on one line. Text, CDATA
+ * and comments are kept verbatim; only whitespace between tags is changed.
+ */
+export function prettyXml(xml: string): string {
+  const tokens =
+    xml.match(
+      // Tags may contain ">" inside quoted attribute values.
+      /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<![^>]*>|<\/?[^>"']*(?:(?:"[^"]*"|'[^']*')[^>"']*)*>|[^<]+/g,
+    ) ?? [];
+  const out: string[] = [];
+  let depth = 0;
+  const pad = () => "  ".repeat(depth);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (!tok.startsWith("<")) {
+      if (tok.trim()) out.push(pad() + tok.trim());
+      continue;
+    }
+    if (tok.startsWith("</")) {
+      depth = Math.max(0, depth - 1);
+      out.push(pad() + tok);
+      continue;
+    }
+    const opening = !tok.startsWith("<?") && !tok.startsWith("<!") && !tok.endsWith("/>");
+    if (opening) {
+      // <tag>text</tag> and <tag></tag> stay on one line.
+      const next = tokens[i + 1];
+      if (next?.startsWith("</")) {
+        out.push(pad() + tok + next);
+        i++;
+        continue;
+      }
+      if (next && !next.startsWith("<") && tokens[i + 2]?.startsWith("</")) {
+        out.push(pad() + tok + next + tokens[i + 2]);
+        i += 2;
+        continue;
+      }
+      out.push(pad() + tok);
+      depth++;
+      continue;
+    }
+    out.push(pad() + tok);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Optional summaries for specific XML formats, tried in order before the generic
+ * output. A summarizer returns Markdown when it recognises the document, or null.
+ */
+export type XmlSummarizer = (xml: string) => { title: string; summary: string } | null;
+export const xmlSummarizers: XmlSummarizer[] = [];
+
+const extractXml: Extractor = async (b, _name, budget) => {
+  const raw = decodeText(b);
+  const parts: string[] = [];
+  let handling = "XML";
+  for (const summarize of xmlSummarizers) {
+    try {
+      const result = summarize(raw);
+      if (result) {
+        parts.push(result.summary, "## Full XML");
+        handling = `${result.title} summary, then XML`;
+        break;
+      }
+    } catch {
+      // A failing summarizer never blocks the generic output.
+    }
+  }
+  const lines = raw.split("\n");
+  const longLines = lines.length < 5 || raw.length / lines.length > 500;
+  if (longLines && raw.length <= MAX_XML_PRETTY_CHARS) {
+    parts.push(prettyXml(raw));
+    handling += ", pretty printed";
+  } else {
+    parts.push(raw);
+  }
+  return {
+    kind: "xml",
+    content: [textBlock(budget.takeText(parts.join("\n\n")))],
+    notes: [],
+    handling,
+  };
 };
 
 const extractText: Extractor = async (b, _name, budget) => ({
   kind: "text",
   content: [textBlock(budget.takeText(decodeText(b)))],
   notes: [],
+  handling: "text",
 });
+
+/**
+ * Joins consecutive text blocks with a blank line. Some MCP clients concatenate
+ * adjacent text blocks without any separator, which glued headers to content.
+ */
+export function mergeTextBlocks(content: Content[]): Content[] {
+  const merged: Content[] = [];
+  for (const block of content) {
+    const prev = merged[merged.length - 1];
+    if (block.type === "text" && prev?.type === "text") {
+      merged[merged.length - 1] = { type: "text", text: `${prev.text}\n\n${block.text}` };
+    } else {
+      merged.push(block);
+    }
+  }
+  return merged;
+}
 
 const EXTRACTORS: Partial<Record<Kind, Extractor>> = {
   image: extractImage,
@@ -1283,10 +1427,7 @@ const EXTRACTORS: Partial<Record<Kind, Extractor>> = {
   msg: extractMsg,
   har: extractHar,
   json: extractJson,
-  xml: async (b, name, budget, depth) => ({
-    ...(await extractText(b, name, budget, depth)),
-    kind: "xml",
-  }),
+  xml: extractXml,
   text: extractText,
 };
 
