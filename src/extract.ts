@@ -350,24 +350,85 @@ export interface ExtractOptions {
   maxPages: number;
   maxImages: number;
   harRaw: boolean;
+  /** Also return the full XML after a format-specific summary. */
+  xmlFull?: boolean;
+  /** Size of the whole tool response; defaults to FRESHDESK_MAX_RESPONSE_BYTES. */
+  maxResponseBytes?: number;
 }
 
-/** Shared limits for one tool call, so nested ZIP contents cannot blow up the context. */
+/**
+ * Upper bound for one tool response. MCP clients reject large results (Claude
+ * Desktop at about 1 MB), so images are fitted into what is left after the text.
+ */
+export const MAX_RESPONSE_BYTES = (() => {
+  const v = Number.parseInt(process.env.FRESHDESK_MAX_RESPONSE_BYTES ?? "", 10);
+  return Number.isFinite(v) && v >= 100_000 ? v : 900_000;
+})();
+
+/** One image never takes more than this in the response (base64 characters). */
+const MAX_IMAGE_B64 = 250_000;
+
+const base64Length = (bytes: number) => Math.ceil(bytes / 3) * 4;
+
+/**
+ * Re-encodes an image until its base64 form fits in `limit` characters: first a
+ * lower JPEG quality, then smaller sizes, never below 60% so text in screenshots and
+ * scans stays legible. Null when it cannot fit or be decoded.
+ */
+export async function shrinkToFit(
+  data: Buffer,
+  mimeType: string,
+  limit: number,
+): Promise<{ data: Buffer; mimeType: string } | null> {
+  if (base64Length(data.length) <= limit) return { data, mimeType };
+  if (limit < 15_000) return null;
+  const { Jimp } = await import("jimp");
+  let img: Awaited<ReturnType<typeof Jimp.read>>;
+  try {
+    img = await Jimp.read(data);
+  } catch {
+    return null;
+  }
+  for (const [scale, quality] of [
+    [1, 75],
+    [1, 60],
+    [0.75, 60],
+    [0.6, 55],
+  ]) {
+    const candidate = img.clone();
+    if (scale < 1) candidate.scale(scale);
+    const out = await candidate.getBuffer("image/jpeg", { quality });
+    if (base64Length(out.length) <= limit) return { data: out, mimeType: "image/jpeg" };
+  }
+  return null;
+}
+
+/**
+ * Shared limits for one tool call: characters of text, number of images and bytes
+ * of image data, so nested contents and many files cannot exceed what clients accept.
+ */
 export class Budget {
   chars: number;
   images: number;
+  /** Base64 characters still available for images in this response. */
+  imageBytes: number;
   truncated = false;
-  /** False when the "image" type is disabled: no image (page render, embedded image, frame) is returned. */
+  /** Set when an image was dropped because the response size limit was reached. */
+  sizeLimited = false;
+  /** False when the "image" type is disabled: no image (page render, embedded image) is returned. */
   readonly imagesEnabled = kindEnabled("image");
   constructor(readonly opts: ExtractOptions) {
     this.chars = opts.maxTextChars;
     this.images = this.imagesEnabled ? opts.maxImages : 0;
+    // Room for the text (UTF-8 and JSON escaping included) and the headers is kept aside.
+    const total = opts.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+    this.imageBytes = Math.max(0, total - Math.ceil(opts.maxTextChars * 1.5) - 30_000);
   }
   /** Why an image was not returned, for notes. */
   imageLimitReason(): string {
-    return this.imagesEnabled
-      ? "max_pages/max_images reached"
-      : "images disabled by FRESHDESK_ATTACHMENT_TYPES";
+    if (!this.imagesEnabled) return "images disabled by FRESHDESK_ATTACHMENT_TYPES";
+    if (this.sizeLimited) return "response size limit reached";
+    return "max_pages/max_images reached";
   }
   takeText(s: string): string {
     if (s.length <= this.chars) {
@@ -380,13 +441,49 @@ export class Budget {
     this.truncated = true;
     return kept + note;
   }
+  /** Reserves one image slot. Call fitImage afterwards with the actual data. */
   takeImage(): boolean {
-    if (this.images <= 0) {
-      if (this.imagesEnabled) this.truncated = true;
+    if (this.images <= 0 || this.imageBytes < 15_000) {
+      if (this.imagesEnabled) {
+        this.truncated = true;
+        if (this.images > 0) this.sizeLimited = true;
+      }
       return false;
     }
     this.images--;
     return true;
+  }
+  /** Shrinks an image to fit the remaining response size and accounts for it. Null when it does not fit. */
+  async fitImage(
+    data: Buffer,
+    mimeType: string,
+  ): Promise<{ data: Buffer; mimeType: string } | null> {
+    const fitted = await shrinkToFit(data, mimeType, Math.min(MAX_IMAGE_B64, this.imageBytes));
+    if (!fitted) {
+      this.truncated = true;
+      this.sizeLimited = true;
+      return null;
+    }
+    this.imageBytes -= base64Length(fitted.data.length);
+    return fitted;
+  }
+  /**
+   * Runs fn with at most `images` images and `imageBytes` bytes of this budget, so
+   * one file cannot use everything, then hands the unused part back.
+   */
+  async share<T>(images: number, imageBytes: number, fn: () => Promise<T>): Promise<T> {
+    const images0 = this.images;
+    const bytes0 = this.imageBytes;
+    const grantImages = Math.min(images0, images);
+    const grantBytes = Math.min(bytes0, imageBytes);
+    this.images = grantImages;
+    this.imageBytes = grantBytes;
+    try {
+      return await fn();
+    } finally {
+      this.images = images0 - (grantImages - this.images);
+      this.imageBytes = bytes0 - (grantBytes - this.imageBytes);
+    }
   }
 }
 
@@ -531,11 +628,14 @@ const extractImage: Extractor = async (b, name, budget) => {
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
   if (!img) return { kind: "image-convert", content: [], notes: ["image could not be decoded"] };
+  const fit = await budget.fitImage(img.data, img.mimeType);
+  if (!fit)
+    return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   return {
     kind: "image",
     content: [
       textBlock(`Image: ${name}${img.note ? ` (${img.note})` : ""}`),
-      { type: "image", data: img.data.toString("base64"), mimeType: img.mimeType },
+      { type: "image", data: fit.data.toString("base64"), mimeType: fit.mimeType },
     ],
     notes: img.note ? [img.note] : [],
     handling: img.note ? `image (${img.note})` : "image",
@@ -771,7 +871,15 @@ const extractPdf: Extractor = async (b, _name, budget) => {
       page.cleanup();
       continue;
     }
-    const jpg = await renderPage(page);
+    const fit = await budget.fitImage(await renderPage(page), "image/jpeg");
+    if (!fit) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
+      );
+      page.cleanup();
+      continue;
+    }
+    const jpg = fit.data;
     rendered++;
     if (scanned) scannedRendered++;
     else imagePagesRendered++;
@@ -834,10 +942,17 @@ const extractDocx: Extractor = async (b, _name, budget) => {
       notes.push(`embedded image ${i + 1} could not be decoded`);
       continue;
     }
+    const fit = await budget.fitImage(img.data, img.mimeType);
+    if (!fit) {
+      notes.push(
+        `embedded images ${i + 1} to ${embedded.length} skipped: ${budget.imageLimitReason()}`,
+      );
+      break;
+    }
     images.push(textBlock(`embedded-image-${i + 1}`), {
       type: "image",
-      data: img.data.toString("base64"),
-      mimeType: img.mimeType,
+      data: fit.data.toString("base64"),
+      mimeType: fit.mimeType,
     });
   }
   const markdown = String(result.value ?? "")
@@ -1362,23 +1477,35 @@ const extractXml: Extractor = async (b, _name, budget) => {
   const raw = decodeText(b);
   const parts: string[] = [];
   let handling = "XML";
+  let summarized = false;
   for (const summarize of xmlSummarizers) {
     try {
       const result = summarize(raw);
       if (result) {
-        parts.push(result.summary, "## Full XML");
-        handling = `${result.title} summary, then XML`;
+        parts.push(result.summary);
+        handling = `${result.title} summary`;
+        summarized = true;
         break;
       }
     } catch {
       // A failing summarizer never blocks the generic output.
     }
   }
+  if (summarized && !budget.opts.xmlFull) {
+    parts.push("[Full XML not included. Pass xml_full: true to also get the formatted XML.]");
+    return {
+      kind: "xml",
+      content: [textBlock(budget.takeText(parts.join("\n\n")))],
+      notes: [],
+      handling,
+    };
+  }
+  if (summarized) parts.push("## Full XML");
   const lines = raw.split("\n");
   const longLines = lines.length < 5 || raw.length / lines.length > 500;
   if (longLines && raw.length <= MAX_XML_PRETTY_CHARS) {
     parts.push(prettyXml(raw));
-    handling += ", pretty printed";
+    handling += summarized ? ", then the XML pretty printed" : ", pretty printed";
   } else {
     parts.push(raw);
   }
@@ -1396,6 +1523,57 @@ const extractText: Extractor = async (b, _name, budget) => ({
   notes: [],
   handling: "text",
 });
+
+/** Size of a content block in the JSON-RPC response (approximate, conservative). */
+function blockSize(b: Content): number {
+  if (b.type === "image") return b.data.length + 100;
+  if (b.type === "text") return Math.ceil(Buffer.byteLength(b.text) * 1.1) + 50;
+  return JSON.stringify(b).length;
+}
+
+/**
+ * Last line of defence against responses clients reject: drops images from the end,
+ * then shortens the longest text, until the response fits in `limit` bytes.
+ */
+export function enforceResponseSize(content: Content[], limit = MAX_RESPONSE_BYTES): Content[] {
+  const out = [...content];
+  let total = out.reduce((n, b) => n + blockSize(b), 0);
+  if (total <= limit) return out;
+  let dropped = 0;
+  for (let i = out.length - 1; i >= 0 && total > limit; i--) {
+    if (out[i].type !== "image") continue;
+    total -= blockSize(out[i]);
+    out.splice(i, 1);
+    dropped++;
+  }
+  while (total > limit) {
+    let longest = -1;
+    for (let i = 0; i < out.length; i++) {
+      const b = out[i];
+      if (
+        b.type === "text" &&
+        (longest < 0 || b.text.length > (out[longest] as { text: string }).text.length)
+      )
+        longest = i;
+    }
+    if (longest < 0) break;
+    const b = out[longest] as { type: "text"; text: string };
+    const keep = Math.max(0, b.text.length - Math.ceil((total - limit) / 1.1) - 200);
+    total -= blockSize(b);
+    out[longest] = {
+      type: "text",
+      text: `${b.text.slice(0, keep)}\n\n[TRUNCATED: response size limit]`,
+    };
+    total += blockSize(out[longest]);
+    if (keep === 0) break;
+  }
+  if (dropped)
+    out.push({
+      type: "text",
+      text: `[${dropped} image(s) removed to stay under the ${limit} byte response limit. Read the files individually to see them.]`,
+    });
+  return out;
+}
 
 /**
  * Joins consecutive text blocks with a blank line. Some MCP clients concatenate
