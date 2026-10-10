@@ -21,6 +21,7 @@ import {
   willAnalyse,
 } from "../extract.js";
 import { errorPayload, type FreshdeskResult, fd, parseLinkHeader } from "../freshdesk.js";
+import { REDACT_ENABLED, scanSensitive } from "../redact.js";
 import { text, tool } from "../util.js";
 
 /* -------------------------------------------------------------------------- */
@@ -414,9 +415,10 @@ function limitedBy(budget: Budget, maxImages: number): string[] {
   return out;
 }
 
-const PARTIAL_STATUS =
-  "partial: some content left out by the limits, read it with get_ticket_attachment";
-const SKIPPED_STATUS = "skipped: output limits reached, read it with get_ticket_attachment";
+type FileStatus = "read" | "partial" | "skipped" | "not_analysed" | "disabled" | "error";
+
+/** In the first pass, a loose image gets at most this much (base64 characters). */
+const LOOSE_IMAGE_PREVIEW_B64 = 70_000;
 
 const LIMIT_PARAMS = {
   max_text_chars: z
@@ -505,14 +507,14 @@ async function readAttachment(
     return none({
       handling: DISABLED_HANDLING,
       analysed: false,
-      reason: "This file type is disabled by the server configuration. It was not downloaded.",
+      reason: "type disabled by FRESHDESK_ATTACHMENT_TYPES (not downloaded)",
     });
   }
   if (!willAnalyse(kindByName)) {
     return none({
       handling: HANDLING[kindByName],
       analysed: false,
-      reason: "This file type cannot be read. It was not downloaded.",
+      reason: `${HANDLING[kindByName]} (not downloaded)`,
     });
   }
   if (!att.attachment_url) return none({ error: "Attachment has no download URL" });
@@ -531,16 +533,44 @@ async function readAttachment(
   cache?.set(att.id, dl.bytes);
 
   const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
+
+  // Sensitive data: always detected and reported, masked with FRESHDESK_REDACT=1.
+  const found = new Set<string>();
+  const content = out.content.map((b) => {
+    if (b.type !== "text") return b;
+    const scan = scanSensitive(b.text);
+    for (const f of scan.found) found.add(f);
+    return { ...b, text: scan.text };
+  });
+  const hasImages = content.some((b) => b.type === "image");
+  const sensitive = found.size
+    ? {
+        sensitive_data: {
+          found: [...found],
+          masked: REDACT_ENABLED,
+          note: REDACT_ENABLED
+            ? `Masked in the text.${hasImages ? " Images are never masked." : ""}`
+            : "Not masked (set FRESHDESK_REDACT=1 to mask). Avoid repeating these values.",
+        },
+      }
+    : hasImages
+      ? { images_note: "Images (screenshots, scans) are not checked for sensitive data." }
+      : {};
+
+  // With no content, the first note is the reason: keep it once, as reason.
+  const reason = out.content.length ? undefined : out.notes[0];
+  const notes = reason ? out.notes.slice(1) : out.notes;
   const header = {
     ...meta,
     downloaded_bytes: dl.bytes.length,
     detected_kind: out.kind,
     handling: out.handling ?? HANDLING[out.kind],
     truncated: budget.truncated,
-    notes: out.notes,
-    ...(out.content.length ? {} : { analysed: false }),
+    ...(notes.length ? { notes } : {}),
+    ...(reason ? { analysed: false, reason } : {}),
+    ...sensitive,
   };
-  return { header, content: out.content };
+  return { header, content };
 }
 
 export function registerAttachmentTools(server: McpServer) {
@@ -636,7 +666,7 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachments",
-    "Read several (or all) attachments of a ticket in one call, with the same rules as get_ticket_attachment and one output budget shared by all files. Starts with a JSON summary of every attachment (handling, status), then each file under a '===== Attachment N of M =====' marker. Files that cannot be analysed are not downloaded. Documents (PDF, Office, archives) are processed before loose images, and every file that can produce images gets a fair share of the image budget. The response is kept under the client size limit (about 900 KB), which usually limits images before max_images does: images are recompressed or left out, and 'limited_by' in the summary says which limit applied. Files are marked 'read', 'partial' (something was left out: read it again with get_ticket_attachment) or skipped.",
+    "Read several (or all) attachments of a ticket in one call, with one output budget shared by all files. Starts with a JSON summary: counters (read, partial, skipped, not_analysed, errors), 'limited_by' when something was left out, a sensitive data warning, and per file a status ('read', 'partial', 'skipped', 'not_analysed', 'disabled', 'error') with its reason. Then each file under a '===== Attachment N of M =====' marker. Documents are processed before loose images, which only get a preview-sized share at first. The response is kept under the client size limit (about 900 KB), which usually limits images before max_images does: images are encoded more cheaply (JPEG, greyscale for black and white pages) and what is left after a first pass goes to files that were cut. Read 'partial' or 'skipped' files alone with get_ticket_attachment.",
     {
       ticket_id: z.number().int(),
       attachment_ids: z
@@ -649,6 +679,11 @@ export function registerAttachmentTools(server: McpServer) {
       max_text_chars: LIMIT_PARAMS.max_text_chars
         .default(100_000)
         .describe("Maximum characters of extracted text returned in total (default 100000)."),
+      max_images: LIMIT_PARAMS.max_images
+        .default(15)
+        .describe(
+          "Maximum images returned in total (default 15). The response size limit usually applies first.",
+        ),
     },
     async ({ ticket_id, attachment_ids, ...limits }): Promise<CallToolResult> => {
       const found = await collectAttachments(ticket_id);
@@ -661,6 +696,7 @@ export function registerAttachmentTools(server: McpServer) {
         : found.items;
 
       const budget = budgetFrom(limits);
+      budget.economy = true;
       const kinds = selected.map((h) => classifyByName(h.att.name ?? "", h.att.content_type ?? ""));
       // Documents first: a scanned PDF only has content as images, a loose photo
       // in a reply is usually less important. Output keeps the ticket order.
@@ -671,107 +707,173 @@ export function registerAttachmentTools(server: McpServer) {
         .filter((i) => IMAGE_CAPABLE.has(kinds[i]) && willAnalyse(kinds[i]))
         .reduce((n, i) => n + (IMAGE_WEIGHT[kinds[i]] ?? 1), 0);
 
-      const summary: Record<string, unknown>[] = new Array(selected.length);
-      const sections: Content[][] = new Array(selected.length);
-      const usage: { chars: number; images: number; bytes: number }[] = new Array(selected.length);
-      const partialFiles: number[] = [];
+      interface FileResult {
+        entry: Record<string, unknown>;
+        section: Content[];
+        usage: { chars: number; images: number; bytes: number };
+        status: FileStatus;
+        minorDeferred: boolean;
+      }
+      const results: FileResult[] = new Array(selected.length);
       const cache = new Map<number, Buffer>();
 
-      const runFile = async (i: number, shareImages: number, shareBytes: number) => {
+      const runFile = async (
+        i: number,
+        shareImages: number,
+        shareBytes: number,
+      ): Promise<FileResult> => {
         const hit = selected[i];
         const before = { chars: budget.chars, images: budget.images, bytes: budget.imageBytes };
         const truncatedBefore = budget.truncated;
+        const minorBefore = budget.minorDeferred;
         budget.truncated = false;
         const { header, content } = await budget.share(shareImages, shareBytes, () =>
           readAttachment(ticket_id, hit, budget, cache),
         );
-        const partial = budget.truncated;
-        budget.truncated = truncatedBefore || partial;
-        usage[i] = {
-          chars: before.chars - budget.chars,
-          images: before.images - budget.images,
-          bytes: before.bytes - budget.imageBytes,
-        };
-        const firstNote = Array.isArray(header.notes) ? header.notes[0] : undefined;
-        const status = header.error
-          ? `error: ${header.error}`
-          : content.length
-            ? partial
-              ? PARTIAL_STATUS
-              : "read"
-            : partial
-              ? SKIPPED_STATUS
-              : String(header.reason ?? firstNote ?? "not analysed");
-        summary[i] = {
+        const cut = budget.truncated;
+        budget.truncated = truncatedBefore || cut;
+        const minorDeferred = budget.minorDeferred > minorBefore;
+
+        let status: FileStatus;
+        let reason: string | undefined;
+        if (header.error) {
+          status = "error";
+          reason = String(header.error);
+        } else if (content.length) {
+          status = cut ? "partial" : "read";
+          if (cut)
+            reason =
+              "some pages or images left out by the response size limit: read it alone with get_ticket_attachment";
+        } else if (cut) {
+          status = "skipped";
+          reason = "no room left in this response: read it alone with get_ticket_attachment";
+        } else if (String(header.reason ?? "").includes("FRESHDESK_ATTACHMENT_TYPES")) {
+          status = "disabled";
+          reason = String(header.reason);
+        } else {
+          status = "not_analysed";
+          reason = String(header.reason ?? "not analysed");
+        }
+        const entry: Record<string, unknown> = {
           id: hit.att.id,
           name: header.name,
           origin: header.origin,
-          conversation_id: header.conversation_id,
-          handling: header.handling,
+          ...(header.conversation_id ? { conversation_id: header.conversation_id } : {}),
           status,
-          ...(Array.isArray(header.notes) && header.notes.length ? { notes: header.notes } : {}),
+          ...(reason ? { reason } : {}),
+          // For files that were not analysed, the reason already says what they are.
+          ...(header.handling && status !== "not_analysed" && status !== "disabled"
+            ? { handling: header.handling }
+            : {}),
+          ...(header.notes ? { notes: header.notes } : {}),
+          ...(header.sensitive_data ? { sensitive_data: header.sensitive_data } : {}),
         };
-        sections[i] = content.length
+        const section: Content[] = content.length
           ? [
               {
                 type: "text",
-                text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nHandling: ${header.handling}${partial ? `\nStatus: ${PARTIAL_STATUS}` : ""}`,
+                text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${reason ? ` (${reason})` : ""}\nHandling: ${header.handling}${header.sensitive_data ? `\nSensitive data: ${(header.sensitive_data as { found: string[] }).found.join(", ")}` : ""}`,
               },
               ...content,
             ]
           : [];
-        // Left out or cut by the limits (not unreadable): eligible for the second pass.
-        return partial && !header.error;
+        return {
+          entry,
+          section,
+          usage: {
+            chars: before.chars - budget.chars,
+            images: before.images - budget.images,
+            bytes: before.bytes - budget.imageBytes,
+          },
+          status,
+          minorDeferred,
+        };
       };
 
       // Pass 1: every file, documents first, each with a weighted share of the image
-      // budget. PDF pages whose only images are logos or signatures wait for pass 2.
+      // budget. A loose image gets at most a preview-sized share. PDF pages whose
+      // only images are logos or signatures wait for pass 2.
       budget.deferMinorPages = true;
       for (const i of order) {
         const kind = kinds[i];
-        if (budget.chars <= 0 && budget.images <= 0 && willAnalyse(kind)) {
-          budget.truncated = true;
-          summary[i] = {
-            id: selected[i].att.id,
-            name: selected[i].att.name,
-            status: SKIPPED_STATUS,
-          };
-          sections[i] = [];
-          continue;
-        }
         const capable = IMAGE_CAPABLE.has(kind) && willAnalyse(kind);
         const weight = capable ? (IMAGE_WEIGHT[kind] ?? 1) : 0;
         const fraction = weight / Math.max(1, weightLeft);
-        const shareImages = capable ? Math.ceil(budget.images * fraction) : 0;
-        const shareBytes = capable ? Math.floor(budget.imageBytes * fraction) : 0;
+        let shareImages = capable ? Math.ceil(budget.images * fraction) : 0;
+        let shareBytes = capable ? Math.floor(budget.imageBytes * fraction) : 0;
+        if (kind === "image" || kind === "image-convert") {
+          shareImages = Math.min(shareImages, 1);
+          shareBytes = Math.min(shareBytes, LOOSE_IMAGE_PREVIEW_B64);
+        }
         weightLeft -= weight;
-        if (await runFile(i, shareImages, shareBytes)) partialFiles.push(i);
+        results[i] = await runFile(i, shareImages, shareBytes);
       }
 
+      // Pass 2: the room left (unused image budget, plus the text reserve that pass 1
+      // did not need) goes to files that were cut, then to pages held back for small
+      // images, in priority order. A file is read again from memory with its pass-1
+      // usage given back, and its pass-1 result is kept unless the new one is better.
       budget.deferMinorPages = false;
-      // Pass 2: what other files did not use goes to the files left partial, in priority
-      // order. Each one is read again with its first-pass usage given back, so it can
-      // only get more. Files are not downloaded twice.
-      for (const i of partialFiles) {
-        if (!IMAGE_CAPABLE.has(kinds[i]) || budget.imageBytes + usage[i].bytes < 60_000) continue;
-        if (budget.images + usage[i].images <= usage[i].images) continue; // nothing extra to give
-        budget.chars += usage[i].chars;
-        budget.images += usage[i].images;
-        budget.imageBytes += usage[i].bytes;
-        await runFile(i, budget.images, budget.imageBytes);
+      budget.imageBytes += Math.floor(budget.chars * 1.5);
+      budget.chars = 0;
+      const rank: Record<FileStatus, number> = {
+        read: 4,
+        partial: 3,
+        skipped: 2,
+        not_analysed: 1,
+        disabled: 1,
+        error: 0,
+      };
+      const candidates = [
+        ...order.filter((i) => results[i].status === "partial" || results[i].status === "skipped"),
+        ...order.filter((i) => results[i].status === "read" && results[i].minorDeferred),
+      ];
+      for (const i of candidates) {
+        const prev = results[i];
+        if (budget.imageBytes + prev.usage.bytes < 40_000 || budget.images + prev.usage.images <= 0)
+          continue;
+        if (budget.imageBytes < 15_000 && budget.images <= 0) break;
+        budget.chars += prev.usage.chars;
+        budget.images += prev.usage.images;
+        budget.imageBytes += prev.usage.bytes;
+        const next = await runFile(i, budget.images, budget.imageBytes);
+        const better =
+          rank[next.status] > rank[prev.status] ||
+          (rank[next.status] === rank[prev.status] &&
+            (next.usage.images > prev.usage.images || (prev.minorDeferred && !next.minorDeferred)));
+        if (better) {
+          results[i] = next;
+        } else {
+          // Undo: give back what the second read used and charge the first one again.
+          budget.chars += next.usage.chars - prev.usage.chars;
+          budget.images += next.usage.images - prev.usage.images;
+          budget.imageBytes += next.usage.bytes - prev.usage.bytes;
+        }
       }
 
-      const body = sections.filter(Boolean).flat();
+      const entries = results.map((r) => r.entry);
+      const count = (st: FileStatus) => results.filter((r) => r.status === st).length;
+      const sensitiveFiles = entries.filter((e) => e.sensitive_data).map((e) => e.name);
+      const cutAny = results.some((r) => r.status === "partial" || r.status === "skipped");
       const overview = {
         ticket_id,
         attachments: selected.length,
-        read: summary.filter((s) => s.status === "read").length,
-        partial: summary.filter((s) => s.status === PARTIAL_STATUS).length,
-        truncated: budget.truncated,
-        ...(budget.truncated ? { limited_by: limitedBy(budget, limits.max_images) } : {}),
+        read: count("read"),
+        partial: count("partial"),
+        skipped: count("skipped"),
+        not_analysed: count("not_analysed"),
+        ...(count("disabled") ? { disabled: count("disabled") } : {}),
+        errors: count("error"),
+        ...(cutAny ? { limited_by: limitedBy(budget, limits.max_images) } : {}),
+        ...(sensitiveFiles.length
+          ? {
+              sensitive_data_warning: `${sensitiveFiles.length} file(s) contain sensitive data (${REDACT_ENABLED ? "masked in the text" : "not masked"}): ${sensitiveFiles.join(", ")}. Images are never checked or masked.`,
+            }
+          : {}),
         ...(missing.length ? { not_found: missing } : {}),
-        files: summary,
+        files: entries,
       };
+      const body = results.flatMap((r) => r.section);
       return {
         content: enforceResponseSize(
           mergeTextBlocks([
