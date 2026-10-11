@@ -11,9 +11,7 @@ import {
   extractAny,
   HANDLING,
   isAnimatedGif,
-  type Kind,
   kindEnabled,
-  MAX_RESPONSE_BYTES,
   MIN_IMAGE_DIMENSION,
   mergeTextBlocks,
   toSupportedImage,
@@ -377,48 +375,7 @@ function conversationOrigin(c: FdConversation): string {
 /* Reading one attachment (shared by get_ticket_attachment(s))                 */
 /* -------------------------------------------------------------------------- */
 
-/** Processing order for get_ticket_attachments: lower first. */
-const PRIORITY: Partial<Record<Kind, number>> = {
-  pdf: 0,
-  docx: 1,
-  pptx: 1,
-  zip: 2,
-  eml: 3,
-  msg: 3,
-  xlsx: 3,
-  csv: 3,
-  image: 5,
-  "image-convert": 5,
-};
-/**
- * Kinds that can return images and their weight when sharing the image budget:
- * documents usually need several images (pages, screenshots), a loose image one.
- */
-const IMAGE_WEIGHT: Partial<Record<Kind, number>> = {
-  pdf: 3,
-  docx: 3,
-  zip: 2,
-  image: 1,
-  "image-convert": 1,
-};
-const IMAGE_CAPABLE: ReadonlySet<Kind> = new Set(Object.keys(IMAGE_WEIGHT) as Kind[]);
-/** Which limits stopped content from being returned, in plain words for the model. */
-function limitedBy(budget: Budget, maxImages: number): string[] {
-  const out: string[] = [];
-  if (budget.sizeLimited)
-    out.push(
-      `response size (about ${Math.round(MAX_RESPONSE_BYTES / 1000)} KB, the client limit): images were recompressed or left out before max_images was reached`,
-    );
-  if (budget.images <= 0 && maxImages > 0) out.push(`max_images (${maxImages})`);
-  if (budget.chars <= 0) out.push("max_text_chars");
-  if (!out.length) out.push("max_pages or per-file limits");
-  return out;
-}
-
-type FileStatus = "read" | "partial" | "skipped" | "not_analysed" | "disabled" | "error";
-
-/** In the first pass, a loose image gets at most this much (base64 characters). */
-const LOOSE_IMAGE_PREVIEW_B64 = 70_000;
+type FileStatus = "read" | "partial" | "not_analysed" | "disabled" | "error";
 
 const LIMIT_PARAMS = {
   max_text_chars: z
@@ -433,19 +390,21 @@ const LIMIT_PARAMS = {
     .number()
     .int()
     .min(1)
-    .max(20)
+    .max(200)
     .optional()
-    .default(5)
-    .describe("Maximum PDF pages rendered as images in total (default 5)."),
+    .default(50)
+    .describe(
+      "Maximum PDF pages rendered as images in this call (default 50). The response size usually applies first.",
+    ),
   max_images: z
     .number()
     .int()
     .min(0)
-    .max(20)
+    .max(200)
     .optional()
-    .default(10)
+    .default(50)
     .describe(
-      "Maximum images returned in total, including PDF pages and images inside documents or archives (default 10).",
+      "Maximum images returned in this call, including PDF pages and images inside documents or archives (default 50). The response size usually applies first.",
     ),
   har_raw: z
     .boolean()
@@ -550,7 +509,7 @@ async function readAttachment(
           masked: REDACT_ENABLED,
           note: REDACT_ENABLED
             ? `Masked in the text.${hasImages ? " Images are never masked." : ""}`
-            : "Not masked (set FRESHDESK_REDACT=1 to mask). Avoid repeating these values.",
+            : "This attachment contains this kind of data. It is returned as is.",
         },
       }
     : hasImages
@@ -631,9 +590,22 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachment",
-    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos, audio, executables and animated GIFs are not analysed. Large outputs are truncated with a clear marker. Attachment ids come from list_ticket_attachments. To read several attachments in one call, use get_ticket_attachments.",
-    { ticket_id: z.number().int(), attachment_id: z.number().int(), ...LIMIT_PARAMS },
-    async ({ ticket_id, attachment_id, ...limits }): Promise<CallToolResult> => {
+    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/static GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos and animated GIFs are not analysed. When the file does not fit in one response, the result has next_from_image: call again with from_image set to it to get the following pages or images (the text is not repeated). Attachment ids come from list_ticket_attachments. To read several attachments, use get_ticket_attachments.",
+    {
+      ticket_id: z.number().int(),
+      attachment_id: z.number().int(),
+      from_image: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe(
+          "Continue a file that did not fit in one response: skip the images (pages, embedded images) already returned. Use the next_from_image of the previous result.",
+        ),
+      ...LIMIT_PARAMS,
+    },
+    async ({ ticket_id, attachment_id, from_image, ...limits }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
       const found = await collectAttachments(ticket_id);
       if (!found.ok) return text({ error: found.error });
@@ -649,7 +621,23 @@ export function registerAttachmentTools(server: McpServer) {
         });
       }
       const budget = budgetFrom(limits);
-      const { header, content } = await readAttachment(ticket_id, hit, budget);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
+      budget.skipImages = from_image;
+      const read = await readAttachment(ticket_id, hit, budget);
+      const header: Record<string, unknown> = { ...read.header };
+      let content = read.content;
+      if (from_image > 0) {
+        // Continuation: only the images and their labels, the text came with the first part.
+        content = content.filter(
+          (b) => b.type === "image" || (b.type === "text" && b.text.length <= 300),
+        );
+        header.part = `continuation from image ${from_image + 1}`;
+      }
+      if (budget.imagesStopped) {
+        const next = from_image + budget.imagesReturned;
+        header.next_from_image = next;
+        header.continue = `More pages or images remain: call get_ticket_attachment again with from_image: ${next}.`;
+      }
       if (content.length === 0) return text(header);
       return {
         content: enforceResponseSize(
@@ -666,26 +654,30 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachments",
-    "Read several (or all) attachments of a ticket in one call, with one output budget shared by all files. Starts with a JSON summary: counters (read, partial, skipped, not_analysed, errors), 'limited_by' when something was left out, a sensitive data warning, and per file a status ('read', 'partial', 'skipped', 'not_analysed', 'disabled', 'error') with its reason. Then each file under a '===== Attachment N of M =====' marker. Documents are processed before loose images, which only get a preview-sized share at first. The response is kept under the client size limit (about 900 KB), which usually limits images before max_images does: images are encoded more cheaply (JPEG, greyscale for black and white pages) and what is left after a first pass goes to files that were cut. Read 'partial' or 'skipped' files alone with get_ticket_attachment.",
+    "Read the attachments of a ticket (all of them, or attachment_ids) in ticket order, in as few calls as needed. Each call returns as many complete files as fit in one response (about 900 KB, the client limit). When more remain, the summary has next_cursor: call again with cursor set to it to continue, until the summary says all attachments have been returned. A file too large for a response on its own is returned in part, with how to continue it with get_ticket_attachment (from_image). Starts with a JSON summary (counters, files in this call with status and reason, sensitive data warning), then each file under a '===== Attachment N of M =====' marker. Videos and animated GIFs are listed as not analysed and never downloaded.",
     {
       ticket_id: z.number().int(),
       attachment_ids: z
         .array(z.number().int())
         .min(1)
-        .max(50)
+        .max(100)
         .optional()
         .describe("Attachments to read. Omit to read every attachment of the ticket."),
+      cursor: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe(
+          "Where to continue: the next_cursor of the previous call (0 for the first call).",
+        ),
       ...LIMIT_PARAMS,
       max_text_chars: LIMIT_PARAMS.max_text_chars
         .default(100_000)
-        .describe("Maximum characters of extracted text returned in total (default 100000)."),
-      max_images: LIMIT_PARAMS.max_images
-        .default(15)
-        .describe(
-          "Maximum images returned in total (default 15). The response size limit usually applies first.",
-        ),
+        .describe("Maximum characters of extracted text returned in this call (default 100000)."),
     },
-    async ({ ticket_id, attachment_ids, ...limits }): Promise<CallToolResult> => {
+    async ({ ticket_id, attachment_ids, cursor, ...limits }): Promise<CallToolResult> => {
       const found = await collectAttachments(ticket_id);
       if (!found.ok) return text({ error: found.error });
       const missing = (attachment_ids ?? []).filter(
@@ -696,43 +688,35 @@ export function registerAttachmentTools(server: McpServer) {
         : found.items;
 
       const budget = budgetFrom(limits);
-      budget.economy = true;
-      const kinds = selected.map((h) => classifyByName(h.att.name ?? "", h.att.content_type ?? ""));
-      // Documents first: a scanned PDF only has content as images, a loose photo
-      // in a reply is usually less important. Output keeps the ticket order.
-      const order = selected
-        .map((_, i) => i)
-        .sort((a, c) => (PRIORITY[kinds[a]] ?? 4) - (PRIORITY[kinds[c]] ?? 4) || a - c);
-      let weightLeft = order
-        .filter((i) => IMAGE_CAPABLE.has(kinds[i]) && willAnalyse(kinds[i]))
-        .reduce((n, i) => n + (IMAGE_WEIGHT[kinds[i]] ?? 1), 0);
-
-      interface FileResult {
-        entry: Record<string, unknown>;
-        section: Content[];
-        usage: { chars: number; images: number; bytes: number };
-        status: FileStatus;
-        minorDeferred: boolean;
-      }
-      const results: FileResult[] = new Array(selected.length);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
       const cache = new Map<number, Buffer>();
+      const entries: Record<string, unknown>[] = [];
+      const sections: Content[] = [];
+      let nextCursor: number | undefined;
 
-      const runFile = async (
-        i: number,
-        shareImages: number,
-        shareBytes: number,
-      ): Promise<FileResult> => {
+      for (let i = cursor; i < selected.length; i++) {
         const hit = selected[i];
-        const before = { chars: budget.chars, images: budget.images, bytes: budget.imageBytes };
-        const truncatedBefore = budget.truncated;
-        const minorBefore = budget.minorDeferred;
+        const before = {
+          chars: budget.chars,
+          images: budget.images,
+          imageBytes: budget.imageBytes,
+          sizeLimited: budget.sizeLimited,
+        };
         budget.truncated = false;
-        const { header, content } = await budget.share(shareImages, shareBytes, () =>
-          readAttachment(ticket_id, hit, budget, cache),
-        );
+        budget.imagesStopped = false;
+        budget.imagesReturned = 0;
+        const { header, content } = await readAttachment(ticket_id, hit, budget, cache);
         const cut = budget.truncated;
-        budget.truncated = truncatedBefore || cut;
-        const minorDeferred = budget.minorDeferred > minorBefore;
+
+        if (cut && i > cursor) {
+          // Does not fit completely after other files: leave it whole for the next call.
+          budget.chars = before.chars;
+          budget.images = before.images;
+          budget.imageBytes = before.imageBytes;
+          budget.sizeLimited = before.sizeLimited;
+          nextCursor = i;
+          break;
+        }
 
         let status: FileStatus;
         let reason: string | undefined;
@@ -741,12 +725,6 @@ export function registerAttachmentTools(server: McpServer) {
           reason = String(header.error);
         } else if (content.length) {
           status = cut ? "partial" : "read";
-          if (cut)
-            reason =
-              "some pages or images left out by the response size limit: read it alone with get_ticket_attachment";
-        } else if (cut) {
-          status = "skipped";
-          reason = "no room left in this response: read it alone with get_ticket_attachment";
         } else if (String(header.reason ?? "").includes("FRESHDESK_ATTACHMENT_TYPES")) {
           status = "disabled";
           reason = String(header.reason);
@@ -754,131 +732,77 @@ export function registerAttachmentTools(server: McpServer) {
           status = "not_analysed";
           reason = String(header.reason ?? "not analysed");
         }
-        const entry: Record<string, unknown> = {
+        const continueWith =
+          status === "partial"
+            ? budget.imagesStopped
+              ? `Too large for one response: call get_ticket_attachment with attachment_id ${hit.att.id} and from_image ${budget.imagesReturned} for the rest.`
+              : "Text truncated: call get_ticket_attachment with a larger max_text_chars for the rest."
+            : undefined;
+        entries.push({
+          number: i + 1,
           id: hit.att.id,
           name: header.name,
           origin: header.origin,
           ...(header.conversation_id ? { conversation_id: header.conversation_id } : {}),
           status,
           ...(reason ? { reason } : {}),
-          // For files that were not analysed, the reason already says what they are.
+          ...(continueWith ? { continue: continueWith } : {}),
           ...(header.handling && status !== "not_analysed" && status !== "disabled"
             ? { handling: header.handling }
             : {}),
           ...(header.notes ? { notes: header.notes } : {}),
           ...(header.sensitive_data ? { sensitive_data: header.sensitive_data } : {}),
-        };
-        const section: Content[] = content.length
-          ? [
-              {
-                type: "text",
-                text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${reason ? ` (${reason})` : ""}\nHandling: ${header.handling}${header.sensitive_data ? `\nSensitive data: ${(header.sensitive_data as { found: string[] }).found.join(", ")}` : ""}`,
-              },
-              ...content,
-            ]
-          : [];
-        return {
-          entry,
-          section,
-          usage: {
-            chars: before.chars - budget.chars,
-            images: before.images - budget.images,
-            bytes: before.bytes - budget.imageBytes,
-          },
-          status,
-          minorDeferred,
-        };
-      };
-
-      // Pass 1: every file, documents first, each with a weighted share of the image
-      // budget. A loose image gets at most a preview-sized share. PDF pages whose
-      // only images are logos or signatures wait for pass 2.
-      budget.deferMinorPages = true;
-      for (const i of order) {
-        const kind = kinds[i];
-        const capable = IMAGE_CAPABLE.has(kind) && willAnalyse(kind);
-        const weight = capable ? (IMAGE_WEIGHT[kind] ?? 1) : 0;
-        const fraction = weight / Math.max(1, weightLeft);
-        let shareImages = capable ? Math.ceil(budget.images * fraction) : 0;
-        let shareBytes = capable ? Math.floor(budget.imageBytes * fraction) : 0;
-        if (kind === "image" || kind === "image-convert") {
-          shareImages = Math.min(shareImages, 1);
-          shareBytes = Math.min(shareBytes, LOOSE_IMAGE_PREVIEW_B64);
+        });
+        if (content.length) {
+          sections.push(
+            {
+              type: "text",
+              text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${continueWith ? ` (${continueWith})` : ""}\nHandling: ${header.handling}${header.sensitive_data ? `\nSensitive data: ${(header.sensitive_data as { found: string[] }).found.join(", ")}` : ""}`,
+            },
+            ...content,
+          );
         }
-        weightLeft -= weight;
-        results[i] = await runFile(i, shareImages, shareBytes);
-      }
-
-      // Pass 2: the room left (unused image budget, plus the text reserve that pass 1
-      // did not need) goes to files that were cut, then to pages held back for small
-      // images, in priority order. A file is read again from memory with its pass-1
-      // usage given back, and its pass-1 result is kept unless the new one is better.
-      budget.deferMinorPages = false;
-      budget.imageBytes += Math.floor(budget.chars * 1.5);
-      budget.chars = 0;
-      const rank: Record<FileStatus, number> = {
-        read: 4,
-        partial: 3,
-        skipped: 2,
-        not_analysed: 1,
-        disabled: 1,
-        error: 0,
-      };
-      const candidates = [
-        ...order.filter((i) => results[i].status === "partial" || results[i].status === "skipped"),
-        ...order.filter((i) => results[i].status === "read" && results[i].minorDeferred),
-      ];
-      for (const i of candidates) {
-        const prev = results[i];
-        if (budget.imageBytes + prev.usage.bytes < 40_000 || budget.images + prev.usage.images <= 0)
-          continue;
-        if (budget.imageBytes < 15_000 && budget.images <= 0) break;
-        budget.chars += prev.usage.chars;
-        budget.images += prev.usage.images;
-        budget.imageBytes += prev.usage.bytes;
-        const next = await runFile(i, budget.images, budget.imageBytes);
-        const better =
-          rank[next.status] > rank[prev.status] ||
-          (rank[next.status] === rank[prev.status] &&
-            (next.usage.images > prev.usage.images || (prev.minorDeferred && !next.minorDeferred)));
-        if (better) {
-          results[i] = next;
-        } else {
-          // Undo: give back what the second read used and charge the first one again.
-          budget.chars += next.usage.chars - prev.usage.chars;
-          budget.images += next.usage.images - prev.usage.images;
-          budget.imageBytes += next.usage.bytes - prev.usage.bytes;
+        if (cut) {
+          // A file larger than a whole response: what fits was returned, continue after it.
+          if (i + 1 < selected.length) nextCursor = i + 1;
+          break;
         }
       }
 
-      const entries = results.map((r) => r.entry);
-      const count = (st: FileStatus) => results.filter((r) => r.status === st).length;
+      const count = (st: FileStatus) => entries.filter((e) => e.status === st).length;
       const sensitiveFiles = entries.filter((e) => e.sensitive_data).map((e) => e.name);
-      const cutAny = results.some((r) => r.status === "partial" || r.status === "skipped");
       const overview = {
         ticket_id,
         attachments: selected.length,
+        this_call: entries.length
+          ? `attachments ${cursor + 1} to ${cursor + entries.length} of ${selected.length}`
+          : "none",
         read: count("read"),
         partial: count("partial"),
-        skipped: count("skipped"),
         not_analysed: count("not_analysed"),
         ...(count("disabled") ? { disabled: count("disabled") } : {}),
         errors: count("error"),
-        ...(cutAny ? { limited_by: limitedBy(budget, limits.max_images) } : {}),
+        ...(nextCursor !== undefined
+          ? {
+              next_cursor: nextCursor,
+              continue: `${selected.length - nextCursor} attachment(s) left: call get_ticket_attachments again with cursor: ${nextCursor}.`,
+            }
+          : { complete: "All attachments have been returned." }),
         ...(sensitiveFiles.length
           ? {
-              sensitive_data_warning: `${sensitiveFiles.length} file(s) contain sensitive data (${REDACT_ENABLED ? "masked in the text" : "not masked"}): ${sensitiveFiles.join(", ")}. Images are never checked or masked.`,
+              sensitive_data_warning: `${sensitiveFiles.length} file(s) contain sensitive data: ${sensitiveFiles.join(", ")}. Images are not checked.`,
             }
           : {}),
         ...(missing.length ? { not_found: missing } : {}),
         files: entries,
       };
-      const body = results.flatMap((r) => r.section);
       return {
         content: enforceResponseSize(
           mergeTextBlocks([
             { type: "text", text: JSON.stringify(overview, null, 2) },
-            ...(body.length ? [{ type: "text" as const, text: UNTRUSTED_NOTICE }, ...body] : []),
+            ...(sections.length
+              ? [{ type: "text" as const, text: UNTRUSTED_NOTICE }, ...sections]
+              : []),
           ]),
         ),
       };

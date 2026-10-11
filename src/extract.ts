@@ -403,9 +403,6 @@ export async function shrinkToFit(
   return null;
 }
 
-/** Largest image in "economy" mode (reading several files at once), in base64 characters. */
-const ECONOMY_IMAGE_B64 = 150_000;
-
 /**
  * Cheaper encoding for documents read in bulk: JPEG instead of PNG, and greyscale
  * when the image is (almost) black and white, as most scans and many screenshots
@@ -447,10 +444,6 @@ export class Budget {
   truncated = false;
   /** Set when an image was dropped because the response size limit was reached. */
   sizeLimited = false;
-  /** When true, PDF text pages with only small images (logos, signatures) are not rendered. */
-  deferMinorPages = false;
-  /** Pages left unrendered because their only images were small. Not a truncation. */
-  minorDeferred = 0;
   /** Cheaper image encoding, used when several files share one response. */
   economy = false;
   /** False when the "image" type is disabled: no image (page render, embedded image) is returned. */
@@ -480,8 +473,30 @@ export class Budget {
     return kept + note;
   }
   /** Reserves one image slot. Call fitImage afterwards with the actual data. */
+  /** Images to skip because a previous call already returned them (from_image). */
+  skipImages = 0;
+  /** Images returned by this budget, counted in file order. */
+  imagesReturned = 0;
+  /** Set once an image did not fit: later images are not tried, so the next call can continue in order. */
+  imagesStopped = false;
+
+  /**
+   * True when the next image of the file was already returned by a previous call
+   * (from_image): the caller skips it without rendering or decoding it.
+   */
+  skipImage(): boolean {
+    if (this.skipImages <= 0) return false;
+    this.skipImages--;
+    return true;
+  }
+
   takeImage(): boolean {
+    if (this.imagesStopped) {
+      this.truncated = true;
+      return false;
+    }
     if (this.images <= 0 || this.imageBytes < 15_000) {
+      this.imagesStopped = this.imagesEnabled;
       if (this.imagesEnabled) {
         this.truncated = true;
         if (this.images > 0) this.sizeLimited = true;
@@ -496,9 +511,8 @@ export class Budget {
     data: Buffer,
     mimeType: string,
   ): Promise<{ data: Buffer; mimeType: string } | null> {
-    let cap = Math.min(MAX_IMAGE_B64, this.imageBytes);
+    const cap = Math.min(MAX_IMAGE_B64, this.imageBytes);
     if (this.economy) {
-      cap = Math.min(cap, ECONOMY_IMAGE_B64);
       if (base64Length(data.length) > 40_000) {
         const cheaper = await economize(data);
         if (cheaper) {
@@ -513,28 +527,12 @@ export class Budget {
       this.images++;
       this.truncated = true;
       this.sizeLimited = true;
+      this.imagesStopped = true;
       return null;
     }
+    this.imagesReturned++;
     this.imageBytes -= base64Length(fitted.data.length);
     return fitted;
-  }
-  /**
-   * Runs fn with at most `images` images and `imageBytes` bytes of this budget, so
-   * one file cannot use everything, then hands the unused part back.
-   */
-  async share<T>(images: number, imageBytes: number, fn: () => Promise<T>): Promise<T> {
-    const images0 = this.images;
-    const bytes0 = this.imageBytes;
-    const grantImages = Math.min(images0, images);
-    const grantBytes = Math.min(bytes0, imageBytes);
-    this.images = grantImages;
-    this.imageBytes = grantBytes;
-    try {
-      return await fn();
-    } finally {
-      this.images = images0 - (grantImages - this.images);
-      this.imageBytes = bytes0 - (grantBytes - this.imageBytes);
-    }
   }
 }
 
@@ -675,6 +673,8 @@ export interface Extracted {
 type Extractor = (b: Buffer, name: string, budget: Budget, depth: number) => Promise<Extracted>;
 
 const extractImage: Extractor = async (b, name, budget) => {
+  if (budget.skipImage())
+    return { kind: "image", content: [], notes: ["image returned in a previous part"] };
   if (!budget.takeImage())
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
@@ -849,13 +849,6 @@ async function countSignificantImages(
   return { count, largestShortSide };
 }
 
-/**
- * Images whose shorter side is below this (logos, signatures, banners, icons) are
- * "minor": a page that has text and only minor images is rendered only when
- * budget.deferMinorPages is off, i.e. in the second pass of a multi-file read.
- */
-const MINOR_IMAGE_SHORT_SIDE = 120;
-
 const extractPdf: Extractor = async (b, _name, budget) => {
   const pdfjs = await loadPdfjs();
   const napi = await import("@napi-rs/canvas");
@@ -926,15 +919,14 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     if (scanned) scannedPages++;
     else imagePages++;
     const why = scanned ? "scanned page" : `page with ${images} image(s)`;
-    if (!scanned && budget.deferMinorPages && found.largestShortSide < MINOR_IMAGE_SHORT_SIDE) {
-      // Text page whose images look like logos or signatures: rendered later if room is left.
+    if (budget.skipImage()) {
       parts.push(
-        `--- Page ${n} --- (its only images are small, likely a logo or signature: not rendered to save space)\n${pageText}`,
+        `--- Page ${n} --- (${why}, rendered as an image in a previous part)${scanned ? "" : `\n${pageText}`}`,
       );
-      budget.minorDeferred++;
       page.cleanup();
       continue;
     }
+    if (rendered >= budget.opts.maxPages) budget.imagesStopped = true;
     if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
       parts.push(
         `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
@@ -1006,6 +998,7 @@ const extractDocx: Extractor = async (b, _name, budget) => {
   const notes: string[] = [];
   const images: Content[] = [];
   for (let i = 0; i < embedded.length; i++) {
+    if (budget.skipImage()) continue; // returned in a previous part
     if (!budget.takeImage()) {
       notes.push(
         `embedded images ${i + 1} to ${embedded.length} skipped: ${budget.imageLimitReason()}`,
