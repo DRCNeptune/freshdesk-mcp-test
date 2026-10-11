@@ -557,10 +557,22 @@ export class Budget {
     return kept + note;
   }
   /** Reserves one image slot. Call fitImage afterwards with the actual data. */
+  /** Images to skip because a previous call already returned them (from_image). */
+  skipImages = 0;
   /** Images returned by this budget, counted in file order. */
   imagesReturned = 0;
-  /** Set once an image did not fit: later images are not tried. */
+  /** Set once an image did not fit: later images are not tried, so the next call can continue in order. */
   imagesStopped = false;
+
+  /**
+   * True when the next image of the file was already returned by a previous call
+   * (from_image): the caller skips it without rendering or decoding it.
+   */
+  skipImage(): boolean {
+    if (this.skipImages <= 0) return false;
+    this.skipImages--;
+    return true;
+  }
 
   takeImage(): boolean {
     if (this.imagesStopped) {
@@ -748,6 +760,8 @@ export interface Extracted {
 type Extractor = (b: Buffer, name: string, budget: Budget, depth: number) => Promise<Extracted>;
 
 const extractImage: Extractor = async (b, name, budget) => {
+  if (budget.skipImage())
+    return { kind: "image", content: [], notes: ["image returned in a previous part"] };
   if (!budget.takeImage())
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
@@ -995,6 +1009,13 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     if (scanned) scannedPages++;
     else imagePages++;
     const why = scanned ? "scanned page" : `page with ${images} image(s)`;
+    if (budget.skipImage()) {
+      parts.push(
+        `--- Page ${n} --- (${why}, rendered as an image in a previous part)${scanned ? "" : `\n${pageText}`}`,
+      );
+      page.cleanup();
+      continue;
+    }
     if (!napi) {
       parts.push(
         `--- Page ${n} --- (${why}, not rendered: ${RENDERING_UNAVAILABLE})${scanned ? "" : `\n${pageText}`}`,
@@ -1077,6 +1098,7 @@ const extractDocx: Extractor = async (b, _name, budget) => {
   const notes: string[] = [];
   const images: Content[] = [];
   for (let i = 0; i < embedded.length; i++) {
+    if (budget.skipImage()) continue; // returned in a previous part
     if (!budget.takeImage()) {
       notes.push(
         `embedded images ${i + 1} to ${embedded.length} skipped: ${budget.imageLimitReason()}`,

@@ -371,8 +371,10 @@ function conversationOrigin(c: FdConversation): string {
 /* -------------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------- */
-/* Reading one attachment                                                     */
+/* Reading one attachment (shared by get_ticket_attachment(s))                 */
 /* -------------------------------------------------------------------------- */
+
+type FileStatus = "read" | "partial" | "not_analysed" | "disabled" | "error";
 
 const LIMIT_PARAMS = {
   max_text_chars: z
@@ -441,6 +443,8 @@ async function readAttachment(
   ticketId: number,
   hit: AttachmentHit,
   budget: Budget,
+  /** Downloaded files kept for this call, so a second pass does not download again. */
+  cache?: Map<number, Buffer>,
 ): Promise<{ header: Record<string, unknown>; content: Content[] }> {
   const { att } = hit;
   const name = att.name ?? `attachment-${att.id}`;
@@ -479,8 +483,12 @@ async function readAttachment(
   }
 
   // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
-  const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
+  const cached = cache?.get(att.id);
+  const dl = cached
+    ? ({ ok: true, bytes: cached } as const)
+    : await download(att.attachment_url, MAX_FILE_BYTES, true);
   if (!dl.ok) return none({ error: `Download failed: ${dl.reason}` });
+  cache?.set(att.id, dl.bytes);
 
   const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
 
@@ -559,13 +567,22 @@ export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
     "get_ticket_attachment",
-    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/static GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos and animated GIFs are not analysed. The response is kept under the client size limit (about 1 MB), and says when pages or images did not fit. Attachment ids come from list_ticket_attachments.",
+    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/static GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos and animated GIFs are not analysed. When the file does not fit in one response, the result has next_from_image: call again with from_image set to it to get the following pages or images (the text is not repeated). Attachment ids come from list_ticket_attachments. To read several attachments, use get_ticket_attachments.",
     {
       ticket_id: z.number().int(),
       attachment_id: z.number().int(),
+      from_image: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe(
+          "Continue a file that did not fit in one response: skip the images (pages, embedded images) already returned. Use the next_from_image of the previous result.",
+        ),
       ...LIMIT_PARAMS,
     },
-    async ({ ticket_id, attachment_id, ...limits }): Promise<CallToolResult> => {
+    async ({ ticket_id, attachment_id, from_image, ...limits }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
       const found = await collectAttachments(ticket_id);
       if (!found.ok) return text({ error: found.error });
@@ -582,12 +599,22 @@ export function registerAttachmentTools(server: McpServer) {
       }
       const budget = budgetFrom(limits);
       budget.economy = true; // JPEG and greyscale where it changes nothing visible
+      budget.skipImages = from_image;
       const read = await readAttachment(ticket_id, hit, budget);
       const header: Record<string, unknown> = { ...read.header };
-      const { content } = read;
-      if (budget.imagesStopped)
-        header.not_returned =
-          "Some pages or images did not fit in this response (the client limit is about 1 MB).";
+      let content = read.content;
+      if (from_image > 0) {
+        // Continuation: only the images and their labels, the text came with the first part.
+        content = content.filter(
+          (b) => b.type === "image" || (b.type === "text" && b.text.length <= 300),
+        );
+        header.part = `continuation from image ${from_image + 1}`;
+      }
+      if (budget.imagesStopped) {
+        const next = from_image + budget.imagesReturned;
+        header.next_from_image = next;
+        header.continue = `More pages or images remain: call get_ticket_attachment again with from_image: ${next}.`;
+      }
       if (content.length === 0) return text(header);
       return {
         content: enforceResponseSize(
@@ -595,6 +622,157 @@ export function registerAttachmentTools(server: McpServer) {
             { type: "text", text: JSON.stringify(header, null, 2) },
             { type: "text", text: UNTRUSTED_NOTICE },
             ...content,
+          ]),
+        ),
+      };
+    },
+  );
+
+  tool(
+    server,
+    "get_ticket_attachments",
+    "Read the attachments of a ticket (all of them, or attachment_ids) in ticket order, in as few calls as needed. Each call returns as many complete files as fit in one response (about 900 KB, the client limit). When more remain, the summary has next_cursor: call again with cursor set to it to continue, until the summary says all attachments have been returned. A file too large for a response on its own is returned in part, with how to continue it with get_ticket_attachment (from_image). Starts with a JSON summary (counters, files in this call with status and reason), then each file under a '===== Attachment N of M =====' marker. Videos and animated GIFs are listed as not analysed and never downloaded.",
+    {
+      ticket_id: z.number().int(),
+      attachment_ids: z
+        .array(z.number().int())
+        .min(1)
+        .max(100)
+        .optional()
+        .describe("Attachments to read. Omit to read every attachment of the ticket."),
+      cursor: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe(
+          "Where to continue: the next_cursor of the previous call (0 for the first call).",
+        ),
+      ...LIMIT_PARAMS,
+      max_text_chars: LIMIT_PARAMS.max_text_chars
+        .default(100_000)
+        .describe("Maximum characters of extracted text returned in this call (default 100000)."),
+    },
+    async ({ ticket_id, attachment_ids, cursor, ...limits }): Promise<CallToolResult> => {
+      const found = await collectAttachments(ticket_id);
+      if (!found.ok) return text({ error: found.error });
+      const missing = (attachment_ids ?? []).filter(
+        (id) => !found.items.some((c) => c.att.id === id),
+      );
+      const selected = attachment_ids
+        ? found.items.filter((c) => attachment_ids.includes(c.att.id))
+        : found.items;
+
+      const budget = budgetFrom(limits);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
+      const cache = new Map<number, Buffer>();
+      const entries: Record<string, unknown>[] = [];
+      const sections: Content[] = [];
+      let nextCursor: number | undefined;
+
+      for (let i = cursor; i < selected.length; i++) {
+        const hit = selected[i];
+        const before = {
+          chars: budget.chars,
+          images: budget.images,
+          imageBytes: budget.imageBytes,
+          sizeLimited: budget.sizeLimited,
+        };
+        budget.truncated = false;
+        budget.imagesStopped = false;
+        budget.imagesReturned = 0;
+        const { header, content } = await readAttachment(ticket_id, hit, budget, cache);
+        const cut = budget.truncated;
+
+        if (cut && i > cursor) {
+          // Does not fit completely after other files: leave it whole for the next call.
+          budget.chars = before.chars;
+          budget.images = before.images;
+          budget.imageBytes = before.imageBytes;
+          budget.sizeLimited = before.sizeLimited;
+          nextCursor = i;
+          break;
+        }
+
+        let status: FileStatus;
+        let reason: string | undefined;
+        if (header.error) {
+          status = "error";
+          reason = String(header.error);
+        } else if (content.length) {
+          status = cut ? "partial" : "read";
+        } else if (String(header.reason ?? "").includes("FRESHDESK_ATTACHMENT_TYPES")) {
+          status = "disabled";
+          reason = String(header.reason);
+        } else {
+          status = "not_analysed";
+          reason = String(header.reason ?? "not analysed");
+        }
+        const continueWith =
+          status === "partial"
+            ? budget.imagesStopped
+              ? `Too large for one response: call get_ticket_attachment with attachment_id ${hit.att.id} and from_image ${budget.imagesReturned} for the rest.`
+              : "Text truncated: call get_ticket_attachment with a larger max_text_chars for the rest."
+            : undefined;
+        entries.push({
+          number: i + 1,
+          id: hit.att.id,
+          name: header.name,
+          origin: header.origin,
+          ...(header.conversation_id ? { conversation_id: header.conversation_id } : {}),
+          status,
+          ...(reason ? { reason } : {}),
+          ...(continueWith ? { continue: continueWith } : {}),
+          ...(header.handling && status !== "not_analysed" && status !== "disabled"
+            ? { handling: header.handling }
+            : {}),
+          ...(header.notes ? { notes: header.notes } : {}),
+        });
+        if (content.length) {
+          sections.push(
+            {
+              type: "text",
+              text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${continueWith ? ` (${continueWith})` : ""}\nHandling: ${header.handling}`,
+            },
+            ...content,
+          );
+        }
+        if (cut) {
+          // A file larger than a whole response: what fits was returned, continue after it.
+          if (i + 1 < selected.length) nextCursor = i + 1;
+          break;
+        }
+      }
+
+      const count = (st: FileStatus) => entries.filter((e) => e.status === st).length;
+      const overview = {
+        ticket_id,
+        attachments: selected.length,
+        this_call: entries.length
+          ? `attachments ${cursor + 1} to ${cursor + entries.length} of ${selected.length}`
+          : "none",
+        read: count("read"),
+        partial: count("partial"),
+        not_analysed: count("not_analysed"),
+        ...(count("disabled") ? { disabled: count("disabled") } : {}),
+        errors: count("error"),
+        ...(nextCursor !== undefined
+          ? {
+              next_cursor: nextCursor,
+              continue: `${selected.length - nextCursor} attachment(s) left: call get_ticket_attachments again with cursor: ${nextCursor}.`,
+            }
+          : { complete: "All attachments have been returned." }),
+        ...(missing.length ? { not_found: missing } : {}),
+        files: entries,
+      };
+      return {
+        content: enforceResponseSize(
+          mergeTextBlocks([
+            { type: "text", text: JSON.stringify(overview, null, 2) },
+            ...(sections.length
+              ? [{ type: "text" as const, text: UNTRUSTED_NOTICE }, ...sections]
+              : []),
           ]),
         ),
       };

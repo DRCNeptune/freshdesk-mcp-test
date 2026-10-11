@@ -11,7 +11,7 @@
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg" alt="Node"></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-blue.svg" alt="TypeScript"></a>
   <a href="https://github.com/modelcontextprotocol/typescript-sdk"><img src="https://img.shields.io/badge/MCP%20SDK-1.29-purple.svg" alt="MCP SDK"></a>
-  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-197-orange.svg" alt="Tools"></a>
+  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-198-orange.svg" alt="Tools"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
 </p>
 
@@ -48,7 +48,7 @@
 
 | | |
 |---|---|
-| **197 tools** | Tickets, Conversations, Attachments (PDF, Office, ZIP, email, HAR) & inline images, Contacts, Agents, Skills, Roles, Groups, Companies, Discussions, Solutions, Surveys, FSM, Time Entries, Email Configs, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Messages, and more |
+| **198 tools** | Tickets, Conversations, Attachments (PDF, Office, ZIP, email, HAR) & inline images, Contacts, Agents, Skills, Roles, Groups, Companies, Discussions, Solutions, Surveys, FSM, Time Entries, Email Configs, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Messages, and more |
 | **2 prompts** | `create_ticket`, `create_reply` |
 | **Strict Zod validation** | Derived from official Freshdesk docs — invalid input is rejected before hitting the API, with structured `{path, code, message}` errors |
 | **Dual transport** | `stdio` for local clients (Claude Desktop, Cursor) or `Streamable HTTP` for hosted/remote agents |
