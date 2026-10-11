@@ -370,6 +370,88 @@ const MAX_IMAGE_B64 = 250_000;
 
 const base64Length = (bytes: number) => Math.ceil(bytes / 3) * 4;
 
+/* -------------------------------------------------------------------------- */
+/* Optional libraries                                                         */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Page rendering (@napi-rs/canvas) and image conversion (jimp, heic-convert) are
+ * optional: they add about 100 MB to an install. Without them, text is still
+ * extracted from every format and supported images are returned as they are; only
+ * rendering scanned or image PDF pages and converting or resizing images are skipped,
+ * and the output says so.
+ */
+
+interface JimpImage {
+  width: number;
+  height: number;
+  bitmap: { data: Uint8Array };
+  clone(): JimpImage;
+  scale(factor: number): JimpImage;
+  scaleToFit(size: { w: number; h: number }): JimpImage;
+  greyscale(): JimpImage;
+  getBuffer(mime: string, options?: { quality?: number }): Promise<Buffer>;
+}
+interface JimpStatic {
+  read(data: Buffer): Promise<JimpImage>;
+}
+interface CanvasContext2D {
+  fillStyle: string;
+  fillRect(x: number, y: number, w: number, h: number): void;
+}
+interface CanvasLike {
+  width: number;
+  height: number;
+  getContext(type: "2d"): CanvasContext2D;
+  toBuffer(mime: "image/jpeg", quality?: number): Buffer;
+}
+interface CanvasModule {
+  createCanvas(width: number, height: number): CanvasLike;
+}
+type HeicConvert = (options: {
+  buffer: Buffer;
+  format: "JPEG" | "PNG";
+  quality?: number;
+}) => Promise<Uint8Array>;
+
+const optionalModules = new Map<string, Promise<unknown>>();
+
+/** Loads an optional dependency once. Null when it is not installed. */
+function optionalModule<T>(name: string): Promise<T | null> {
+  let loading = optionalModules.get(name);
+  if (!loading) {
+    loading = import(name).catch(() => null);
+    optionalModules.set(name, loading);
+  }
+  return loading as Promise<T | null>;
+}
+
+const loadJimp = async () => (await optionalModule<{ Jimp: JimpStatic }>("jimp"))?.Jimp ?? null;
+const loadCanvas = () => optionalModule<CanvasModule & Record<string, unknown>>("@napi-rs/canvas");
+const loadHeicConvert = async () =>
+  (await optionalModule<{ default: HeicConvert }>("heic-convert"))?.default ?? null;
+
+/** Why an image could not be turned into PNG/JPEG/GIF/WebP. */
+async function whyNotDecoded(b: Buffer): Promise<string> {
+  const isHeic = b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp";
+  const available = isHeic ? (await loadHeicConvert()) !== null : (await loadJimp()) !== null;
+  return available ? "image could not be decoded" : CONVERSION_UNAVAILABLE;
+}
+
+/** Which optional capabilities are installed. */
+export async function optionalCapabilities() {
+  return {
+    renderPdfPages: (await loadCanvas()) !== null,
+    convertImages: (await loadJimp()) !== null,
+    convertHeic: (await loadHeicConvert()) !== null,
+  };
+}
+
+export const RENDERING_UNAVAILABLE =
+  "page rendering is not available (optional dependency @napi-rs/canvas is not installed)";
+export const CONVERSION_UNAVAILABLE =
+  "image conversion is not available (optional dependency jimp or heic-convert is not installed)";
+
 /**
  * Re-encodes an image until its base64 form fits in `limit` characters: first a
  * lower JPEG quality, then smaller sizes, never below 60% so text in screenshots and
@@ -382,8 +464,9 @@ export async function shrinkToFit(
 ): Promise<{ data: Buffer; mimeType: string } | null> {
   if (base64Length(data.length) <= limit) return { data, mimeType };
   if (limit < 15_000) return null;
-  const { Jimp } = await import("jimp");
-  let img: Awaited<ReturnType<typeof Jimp.read>>;
+  const Jimp = await loadJimp();
+  if (!Jimp) return null;
+  let img: JimpImage;
   try {
     img = await Jimp.read(data);
   } catch {
@@ -409,8 +492,9 @@ export async function shrinkToFit(
  * are. Text stays legible. Returns null when it does not save anything.
  */
 async function economize(data: Buffer): Promise<{ data: Buffer; mimeType: string } | null> {
-  const { Jimp } = await import("jimp");
-  let img: Awaited<ReturnType<typeof Jimp.read>>;
+  const Jimp = await loadJimp();
+  if (!Jimp) return null;
+  let img: JimpImage;
   try {
     img = await Jimp.read(data);
   } catch {
@@ -622,12 +706,14 @@ export async function toSupportedImage(
     const isHeic = b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp";
     try {
       if (isHeic) {
-        const { default: heicConvert } = await import("heic-convert");
+        const heicConvert = await loadHeicConvert();
+        if (!heicConvert) return null;
         data = Buffer.from(await heicConvert({ buffer: b, format: "JPEG", quality: 0.85 }));
         mime = "image/jpeg";
         note = "converted from HEIC";
       } else {
-        const { Jimp } = await import("jimp");
+        const Jimp = await loadJimp();
+        if (!Jimp) return null;
         const img = await Jimp.read(b);
         data = await img.getBuffer("image/png");
         mime = "image/png";
@@ -641,7 +727,8 @@ export async function toSupportedImage(
   // Shrink large images (only formats Jimp can re-encode safely).
   if (mime !== "image/webp" && mime !== "image/gif") {
     try {
-      const { Jimp } = await import("jimp");
+      const Jimp = await loadJimp();
+      if (!Jimp) return { data, mimeType: mime, note };
       const img = await Jimp.read(data);
       const tooBig =
         img.width > MAX_IMAGE_EDGE || img.height > MAX_IMAGE_EDGE || data.length > MAX_IMAGE_BYTES;
@@ -678,7 +765,7 @@ const extractImage: Extractor = async (b, name, budget) => {
   if (!budget.takeImage())
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   const img = await toSupportedImage(b);
-  if (!img) return { kind: "image-convert", content: [], notes: ["image could not be decoded"] };
+  if (!img) return { kind: "image-convert", content: [], notes: [await whyNotDecoded(b)] };
   const fit = await budget.fitImage(img.data, img.mimeType);
   if (!fit)
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
@@ -697,12 +784,13 @@ let pdfjsPromise: Promise<typeof import("pdfjs-dist/legacy/build/pdf.mjs")> | un
 async function loadPdfjs() {
   if (!pdfjsPromise) {
     pdfjsPromise = (async () => {
-      const napi = await import("@napi-rs/canvas");
+      const napi = await loadCanvas();
       const g = globalThis as Record<string, unknown>;
-      // pdf.js needs these browser globals to render in Node.
-      for (const k of ["DOMMatrix", "Path2D", "ImageData"] as const) {
-        if (!g[k]) g[k] = (napi as Record<string, unknown>)[k];
-      }
+      // pdf.js needs these browser globals to render in Node (text extraction does not).
+      if (napi)
+        for (const k of ["DOMMatrix", "Path2D", "ImageData"] as const) {
+          if (!g[k]) g[k] = napi[k];
+        }
       return import("pdfjs-dist/legacy/build/pdf.mjs");
     })();
   }
@@ -722,8 +810,8 @@ async function standardFontsPath(): Promise<string> {
 }
 
 class NapiCanvasFactory {
-  private napi: typeof import("@napi-rs/canvas");
-  constructor(napi: typeof import("@napi-rs/canvas")) {
+  private napi: CanvasModule;
+  constructor(napi: CanvasModule) {
     this.napi = napi;
   }
   create(width: number, height: number) {
@@ -851,14 +939,14 @@ async function countSignificantImages(
 
 const extractPdf: Extractor = async (b, _name, budget) => {
   const pdfjs = await loadPdfjs();
-  const napi = await import("@napi-rs/canvas");
+  const napi = await loadCanvas();
   const notes: string[] = [];
   let doc: Awaited<ReturnType<typeof pdfjs.getDocument>["promise"]>;
   try {
     doc = await pdfjs.getDocument({
       data: new Uint8Array(b),
       // biome-ignore lint/suspicious/noExplicitAny: pdf.js 4.4 accepts a factory instance here.
-      canvasFactory: new NapiCanvasFactory(napi) as any,
+      ...(napi ? { canvasFactory: new NapiCanvasFactory(napi) as any } : {}),
       isEvalSupported: false,
       // Lets pdf.js draw the 14 standard PDF fonts when a document does not embed them.
       standardFontDataUrl: await standardFontsPath(),
@@ -876,6 +964,7 @@ const extractPdf: Extractor = async (b, _name, budget) => {
 
   // biome-ignore lint/suspicious/noExplicitAny: pdf.js page proxy.
   const renderPage = async (page: any): Promise<Buffer> => {
+    if (!napi) throw new Error(RENDERING_UNAVAILABLE);
     const base = page.getViewport({ scale: 1 });
     const scale = Math.min(2.5, MAX_IMAGE_EDGE / Math.max(base.width, base.height));
     const vp = page.getViewport({ scale });
@@ -894,6 +983,7 @@ const extractPdf: Extractor = async (b, _name, budget) => {
   let scannedPages = 0;
   let imagePages = 0;
   let scannedRendered = 0;
+  let notRenderable = 0;
   let imagePagesRendered = 0;
   for (let n = 1; n <= doc.numPages; n++) {
     if (budget.chars <= 0 && budget.images <= 0) {
@@ -923,6 +1013,14 @@ const extractPdf: Extractor = async (b, _name, budget) => {
       parts.push(
         `--- Page ${n} --- (${why}, rendered as an image in a previous part)${scanned ? "" : `\n${pageText}`}`,
       );
+      page.cleanup();
+      continue;
+    }
+    if (!napi) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: ${RENDERING_UNAVAILABLE})${scanned ? "" : `\n${pageText}`}`,
+      );
+      notRenderable++;
       page.cleanup();
       continue;
     }
@@ -959,6 +1057,8 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     page.cleanup();
   }
   await doc.destroy();
+  if (notRenderable > 0)
+    notes.push(`${notRenderable} page(s) not rendered: ${RENDERING_UNAVAILABLE}`);
   if (scannedPages > 0)
     notes.push(
       `${scannedPages} page(s) had no text layer (scanned), ${scannedRendered} rendered as images`,
@@ -1007,7 +1107,7 @@ const extractDocx: Extractor = async (b, _name, budget) => {
     }
     const img = await toSupportedImage(embedded[i]);
     if (!img) {
-      notes.push(`embedded image ${i + 1} could not be decoded`);
+      notes.push(`embedded image ${i + 1}: ${await whyNotDecoded(embedded[i])}`);
       continue;
     }
     const fit = await budget.fitImage(img.data, img.mimeType);
