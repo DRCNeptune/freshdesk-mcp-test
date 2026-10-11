@@ -375,6 +375,10 @@ function conversationOrigin(c: FdConversation): string {
 /* Reading one attachment (shared by get_ticket_attachment(s))                 */
 /* -------------------------------------------------------------------------- */
 
+/** The server cannot read text inside images, but the model can: it is asked to look. */
+const IMAGES_CHECK =
+  "The server does not read text inside images: check the screenshots and scans yourself for passwords, tokens, Authorization headers, personal or bank data, and mention what you find.";
+
 type FileStatus = "read" | "partial" | "not_analysed" | "disabled" | "error";
 
 const LIMIT_PARAMS = {
@@ -495,10 +499,12 @@ async function readAttachment(
 
   // Sensitive data: always detected and reported, masked with FRESHDESK_REDACT=1.
   const found = new Set<string>();
+  const where: string[] = [];
   const content = out.content.map((b) => {
     if (b.type !== "text") return b;
     const scan = scanSensitive(b.text);
     for (const f of scan.found) found.add(f);
+    where.push(...scan.where);
     return { ...b, text: scan.text };
   });
   const hasImages = content.some((b) => b.type === "image");
@@ -506,14 +512,13 @@ async function readAttachment(
     ? {
         sensitive_data: {
           found: [...found],
+          where: where.slice(0, 10),
           masked: REDACT_ENABLED,
-          note: REDACT_ENABLED
-            ? `Masked in the text.${hasImages ? " Images are never masked." : ""}`
-            : "This attachment contains this kind of data. It is returned as is.",
+          note: `${REDACT_ENABLED ? "Masked in the text." : "Found in the text, returned as is."}${hasImages ? ` ${IMAGES_CHECK}` : ""}`,
         },
       }
     : hasImages
-      ? { images_note: "Images (screenshots, scans) are not checked for sensitive data." }
+      ? { images_note: IMAGES_CHECK }
       : {};
 
   // With no content, the first note is the reason: keep it once, as reason.
@@ -790,9 +795,10 @@ export function registerAttachmentTools(server: McpServer) {
           : { complete: "All attachments have been returned." }),
         ...(sensitiveFiles.length
           ? {
-              sensitive_data_warning: `${sensitiveFiles.length} file(s) contain sensitive data: ${sensitiveFiles.join(", ")}. Images are not checked.`,
+              sensitive_data_warning: `Sensitive data found in the text of ${sensitiveFiles.length} file(s): ${sensitiveFiles.join(", ")}. See sensitive_data.where in each file.`,
             }
           : {}),
+        ...(sections.some((b) => b.type === "image") ? { images_check: IMAGES_CHECK } : {}),
         ...(missing.length ? { not_found: missing } : {}),
         files: entries,
       };

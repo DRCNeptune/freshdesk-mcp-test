@@ -14,6 +14,13 @@ function mask(value: string, keep = 4): string {
   return `${value.slice(0, keep)}…[REDACTED ${value.length - keep * 2} chars]…${value.slice(-keep)}`;
 }
 
+/** Value shown in a location excerpt: in full when short, abbreviated (for length only) when long. */
+function excerptValue(value: string): string {
+  return value.length <= 48
+    ? value
+    : `${value.slice(0, 8)}…(${value.length} characters)…${value.slice(-6)}`;
+}
+
 function ibanValid(raw: string): boolean {
   const iban = raw.replace(/\s+/g, "").toUpperCase();
   if (!/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(iban)) return false;
@@ -41,11 +48,17 @@ function luhnValid(raw: string): boolean {
   return sum % 10 === 0;
 }
 
+/** Issuer prefixes: Visa, Mastercard, Amex, Discover, JCB, Diners. */
+const CARD_PREFIX = /^(?:4|5[1-5]|2[2-7]|3[47]|6011|65|35|3[068])/;
+
 interface Rule {
   label: string;
   pattern: RegExp;
-  /** Returns the replacement, or null to leave the match untouched (false positive). */
-  replace: (match: string, ...groups: string[]) => string | null;
+  /**
+   * Returns the replacement, or null to leave the match untouched (false positive).
+   * `before` is the text from the previous whitespace up to the match.
+   */
+  replace: (match: string, groups: string[], before: string) => string | null;
 }
 
 const RULES: Rule[] = [
@@ -58,7 +71,7 @@ const RULES: Rule[] = [
     label: "authorization header",
     pattern:
       /\b(Authorization\s*[:=]\s*"?(?:Basic|Bearer|Digest|NTLM|Negotiate)\s+)([A-Za-z0-9+/=._~-]{8,})/gi,
-    replace: (_m, prefix, token) => `${prefix}${mask(token)}`,
+    replace: (_m, [prefix, token]) => `${prefix}${mask(token)}`,
   },
   {
     label: "JWT",
@@ -70,7 +83,7 @@ const RULES: Rule[] = [
     // password: x, "client_secret":"x", api-key=x, ...
     pattern:
       /\b((?:pass(?:word|wd)?|pwd|secret|client[_-]?secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token)"?\s*[:=]\s*"?)([^\s",;<]{3,})/gi,
-    replace: (_m, prefix) => `${prefix}[REDACTED]`,
+    replace: (_m, [prefix]) => `${prefix}[REDACTED]`,
   },
   {
     label: "IBAN",
@@ -81,18 +94,29 @@ const RULES: Rule[] = [
     label: "SWIFT/BIC",
     pattern:
       /\b((?:SWIFT|BIC)(?:\s*\/\s*(?:SWIFT|BIC))?(?:\s*code)?\s*[:.]?\s*)([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\b/gi,
-    replace: (_m, prefix, code) => `${prefix}${mask(code, 2)}`,
+    replace: (_m, [prefix, code]) => `${prefix}${mask(code, 2)}`,
   },
   {
     label: "payment card",
-    pattern: /\b(?:\d[ -]?){12,18}\d\b/g,
-    replace: (m) => (luhnValid(m) ? mask(m.replace(/\D/g, ""), 4) : null),
+    // 13 to 19 digits written together, or in groups of 4 (Amex 4-6-5) with one separator,
+    // not part of a longer number or a date, with a real issuer prefix and a valid Luhn digit.
+    pattern:
+      /(?<![\d-])(?:\d{13,19}|\d{4}([ -])\d{4}\1\d{4}\1\d{1,7}|\d{4}([ -])\d{6}\2\d{5})(?![\d-])/g,
+    replace: (m) => {
+      const digits = m.replace(/\D/g, "");
+      return CARD_PREFIX.test(digits) && luhnValid(digits) ? mask(digits, 4) : null;
+    },
   },
   {
     label: "secret token or licence key",
-    // Long unbroken runs mixing letters and digits (licence keys, API tokens).
+    // Long unbroken runs mixing letters and digits (licence keys, API tokens). Inside the
+    // path of a URL it is an identifier (image or font id), not a secret; in the query
+    // string (?token=, Signature=) it is kept.
     pattern: /[A-Za-z0-9+/=_-]{64,}/g,
-    replace: (m) => (/[A-Za-z]/.test(m) && /\d/.test(m) ? mask(m, 6) : null),
+    replace: (m, _g, before) => {
+      const inUrlPath = before.includes("://") && !before.includes("?");
+      return !inUrlPath && /[A-Za-z]/.test(m) && /\d/.test(m) ? mask(m, 6) : null;
+    },
   },
 ];
 
@@ -100,21 +124,45 @@ export interface ScanResult {
   text: string;
   /** Kinds of sensitive data found, e.g. ["IBAN", "secret token or licence key"]. */
   found: string[];
+  /** Where each kind was found: a short excerpt around it, the value itself shortened. */
+  where: string[];
 }
+
+/** At most this many locations are reported per kind of data. */
+const MAX_LOCATIONS = 3;
 
 /** Finds sensitive data in a text and, when masking is on, replaces it. */
 export function scanSensitive(text: string, redact = REDACT_ENABLED): ScanResult {
   const found = new Set<string>();
+  const where: string[] = [];
+  const perKind = new Map<string, number>();
   let out = text;
   for (const rule of RULES) {
     out = out.replace(rule.pattern, (...args) => {
       const match = args[0] as string;
+      const offset = args[args.length - 2] as number;
+      const source = args[args.length - 1] as string;
       const groups = args.slice(1, -2).map((g) => (typeof g === "string" ? g : ""));
-      const replacement = rule.replace(match, ...groups);
+      const lineStart =
+        Math.max(source.lastIndexOf(" ", offset - 1), source.lastIndexOf("\n", offset - 1)) + 1;
+      const replacement = rule.replace(match, groups, source.slice(lineStart, offset));
       if (replacement === null) return match;
       found.add(rule.label);
+      const seen = perKind.get(rule.label) ?? 0;
+      if (seen < MAX_LOCATIONS) {
+        perKind.set(rule.label, seen + 1);
+        const before = source
+          .slice(Math.max(0, offset - 50), offset)
+          .replace(/\s+/g, " ")
+          .trimStart();
+        const after = source
+          .slice(offset + match.length, offset + match.length + 25)
+          .replace(/\s+/g, " ")
+          .trimEnd();
+        where.push(`${rule.label}: "…${before}${excerptValue(match)}${after}…"`);
+      }
       return redact ? replacement : match;
     });
   }
-  return { text: out, found: [...found] };
+  return { text: out, found: [...found], where };
 }
