@@ -2,6 +2,22 @@ import { createHash } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import {
+  ANIMATED_GIF_HANDLING,
+  Budget,
+  classifyByName,
+  DISABLED_HANDLING,
+  enforceResponseSize,
+  extractAny,
+  HANDLING,
+  isAnimatedGif,
+  kindEnabled,
+  MIN_IMAGE_DIMENSION,
+  mergeTextBlocks,
+  toSupportedImage,
+  UNTRUSTED_NOTICE,
+  willAnalyse,
+} from "../extract.js";
 import { errorPayload, type FreshdeskResult, fd, parseLinkHeader } from "../freshdesk.js";
 import { text, tool } from "../util.js";
 
@@ -15,7 +31,7 @@ function envInt(name: string, fallback: number): number {
 }
 
 /** Per file download limit. */
-const MAX_FILE_BYTES = envInt("FRESHDESK_MAX_ATTACHMENT_BYTES", 5 * 1024 * 1024);
+const MAX_FILE_BYTES = envInt("FRESHDESK_MAX_ATTACHMENT_BYTES", 25 * 1024 * 1024);
 /** Total bytes returned by a single get_ticket_inline_images call. */
 const MAX_TOTAL_BYTES = envInt("FRESHDESK_MAX_TOTAL_ATTACHMENT_BYTES", 20 * 1024 * 1024);
 const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -45,6 +61,8 @@ interface FdAttachment {
   content_type?: string;
   size?: number;
   attachment_url?: string;
+  created_at?: string;
+  scan_state?: number;
 }
 
 interface FdConversation {
@@ -97,6 +115,39 @@ async function fetchAllConversations(
   return { ok: true, conversations };
 }
 
+/** Whether a GIF is animated is only known after download, so the listing says so. */
+const GIF_LIST_HANDLING = "image if static; if animated, treated as video and not analysed";
+
+function isGifName(name: string, contentType: string): boolean {
+  return /\.gif$/i.test(name) || contentType.toLowerCase() === "image/gif";
+}
+
+type AttachmentHit = { att: FdAttachment; origin: string; conversation_id?: number };
+
+/** All attachments on a ticket and its conversations, plus a count of inline images. */
+async function collectAttachments(
+  ticketId: number,
+): Promise<
+  { ok: true; items: AttachmentHit[]; inlineImages: number } | { ok: false; error: unknown }
+> {
+  const t = await fetchTicket(ticketId);
+  if (!t.ok) return { ok: false, error: errorPayload("Failed to fetch ticket", t.res) };
+  const items: AttachmentHit[] = (t.ticket.attachments ?? []).map((att) => ({
+    att,
+    origin: "ticket description",
+  }));
+  let inlineImages = extractImgSrcs(t.ticket.description).length;
+  const conv = await fetchAllConversations(ticketId);
+  if (!conv.ok)
+    return { ok: false, error: errorPayload("Failed to fetch conversations", conv.res) };
+  for (const c of conv.conversations) {
+    inlineImages += extractImgSrcs(c.body).length;
+    for (const att of c.attachments ?? [])
+      items.push({ att, origin: conversationOrigin(c), conversation_id: c.id });
+  }
+  return { ok: true, items, inlineImages };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Safe download                                                              */
 /* -------------------------------------------------------------------------- */
@@ -145,14 +196,25 @@ async function download(raw: string, maxBytes: number, trusted = false): Promise
     const checked = checkUrl(current, trusted);
     if (!checked.ok) return checked;
 
-    let res: Response;
-    try {
-      res = await fetch(checked.url, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
-      });
-    } catch (e) {
-      return { ok: false, reason: `download failed: ${(e as Error).message}` };
+    let res: Response | undefined;
+    // One retry on network errors: servers and CDNs close idle keep-alive
+    // connections, and reusing one fails at once ("fetch failed").
+    for (let attempt = 1; !res; attempt++) {
+      try {
+        res = await fetch(checked.url, {
+          redirect: "manual",
+          signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+        });
+      } catch (e) {
+        const timedOut = (e as Error).name === "TimeoutError";
+        if (attempt >= 2 || timedOut) {
+          const cause = (e as { cause?: { code?: string } }).cause?.code;
+          return {
+            ok: false,
+            reason: `download failed: ${(e as Error).message}${cause ? ` (${cause})` : ""}`,
+          };
+        }
+      }
     }
 
     if (res.status >= 300 && res.status < 400) {
@@ -221,37 +283,6 @@ function sniffImageType(b: Buffer): string | null {
   )
     return "image/webp";
   return null;
-}
-
-/** Image formats that MCP clients and the model can display. */
-const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-
-/** Best-effort file type detection from magic bytes, used to label files we cannot return. */
-function sniffFileType(b: Buffer): string | null {
-  const img = sniffImageType(b);
-  if (img) return img;
-  if (b.length >= 4 && b.toString("ascii", 0, 4) === "%PDF") return "application/pdf";
-  if (b.length >= 4 && b.readUInt32BE(0) === 0x504b0304) return "application/zip";
-  if (b.length >= 2 && b.toString("ascii", 0, 2) === "BM") return "image/bmp";
-  if (b.length >= 4 && (b.readUInt32BE(0) === 0x49492a00 || b.readUInt32BE(0) === 0x4d4d002a))
-    return "image/tiff";
-  if (b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp") {
-    const brand = b.toString("ascii", 8, 12);
-    if (/^(heic|heix|mif1|msf1)$/.test(brand)) return "image/heic";
-    if (brand.startsWith("qt")) return "video/quicktime";
-    return "video/mp4";
-  }
-  if (b.length >= 3 && b[0] === 0x1f && b[1] === 0x8b) return "application/gzip";
-  if (b.length >= 6 && b.subarray(0, 6).equals(Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])))
-    return "application/x-7z-compressed";
-  if (b.length >= 4 && b.toString("ascii", 0, 4) === "Rar!") return "application/vnd.rar";
-  if (b.length >= 8 && b.readUInt32BE(0) === 0xd0cf11e0) return "application/x-ole-storage";
-  return null;
-}
-
-/** True when the buffer looks like binary data (NUL bytes in the first 8 KB). */
-function looksBinary(b: Buffer): boolean {
-  return b.subarray(0, 8192).includes(0);
 }
 
 /** Reads width and height from the image header. Returns null when unknown. */
@@ -336,274 +367,236 @@ function conversationOrigin(c: FdConversation): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Text helpers                                                               */
-/* -------------------------------------------------------------------------- */
-
-const TEXT_EXTENSIONS = new Set([
-  "txt",
-  "log",
-  "json",
-  "xml",
-  "csv",
-  "tsv",
-  "yaml",
-  "yml",
-  "md",
-  "ini",
-  "conf",
-  "cfg",
-  "properties",
-  "env",
-  "html",
-  "htm",
-  "js",
-  "ts",
-  "sql",
-  "sh",
-  "har",
-]);
-
-const TEXT_CONTENT_TYPES = new Set([
-  "application/json",
-  "application/xml",
-  "application/yaml",
-  "application/x-yaml",
-  "application/javascript",
-  "application/x-sh",
-  "application/sql",
-  "application/x-ndjson",
-  "application/har+json",
-]);
-
-/** Extensions of files the model cannot read directly (documents, archives, media, binaries). */
-const NON_READABLE_EXTENSIONS = new Set([
-  "pdf",
-  "doc",
-  "docx",
-  "xls",
-  "xlsx",
-  "ppt",
-  "pptx",
-  "odt",
-  "ods",
-  "odp",
-  "rtf",
-  "zip",
-  "rar",
-  "7z",
-  "gz",
-  "tgz",
-  "tar",
-  "bz2",
-  "xz",
-  "mp4",
-  "mov",
-  "avi",
-  "mkv",
-  "webm",
-  "wmv",
-  "m4v",
-  "mp3",
-  "wav",
-  "m4a",
-  "ogg",
-  "exe",
-  "dll",
-  "msi",
-  "dmg",
-  "apk",
-  "ipa",
-  "jar",
-  "bin",
-  "iso",
-  "bmp",
-  "tif",
-  "tiff",
-  "heic",
-  "heif",
-  "psd",
-  "ai",
-  "eps",
-]);
-
-function extension(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
-}
-
-function isTextLike(contentType: string, name: string): boolean {
-  const ct = contentType.toLowerCase();
-  if (ct.startsWith("text/")) return true;
-  if (TEXT_CONTENT_TYPES.has(ct) || ct.endsWith("+json")) return true;
-  return TEXT_EXTENSIONS.has(extension(name));
-}
-
-/* -------------------------------------------------------------------------- */
 /* Tools                                                                      */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* Reading one attachment                                                     */
+/* -------------------------------------------------------------------------- */
+
+const LIMIT_PARAMS = {
+  max_text_chars: z
+    .number()
+    .int()
+    .min(1000)
+    .max(500_000)
+    .optional()
+    .default(60_000)
+    .describe("Maximum characters of extracted text returned in total (default 60000)."),
+  max_pages: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe(
+      "Maximum PDF pages rendered as images in this call (default 50). The response size usually applies first.",
+    ),
+  max_images: z
+    .number()
+    .int()
+    .min(0)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe(
+      "Maximum images returned in this call, including PDF pages and images inside documents or archives (default 50). The response size usually applies first.",
+    ),
+  har_raw: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe("For HAR files, return the raw JSON instead of the request summary."),
+  xml_full: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "For XML with a format-specific summary (for example application exports), also return the full formatted XML.",
+    ),
+};
+
+function budgetFrom(l: {
+  max_text_chars: number;
+  max_pages: number;
+  max_images: number;
+  har_raw: boolean;
+  xml_full: boolean;
+}): Budget {
+  return new Budget({
+    maxTextChars: l.max_text_chars,
+    maxPages: l.max_pages,
+    maxImages: l.max_images,
+    harRaw: l.har_raw,
+    xmlFull: l.xml_full,
+  });
+}
+
+/**
+ * Downloads and extracts one attachment within the given budget. Never throws:
+ * skipped and failed files return a header explaining why and no content.
+ */
+async function readAttachment(
+  ticketId: number,
+  hit: AttachmentHit,
+  budget: Budget,
+): Promise<{ header: Record<string, unknown>; content: Content[] }> {
+  const { att } = hit;
+  const name = att.name ?? `attachment-${att.id}`;
+  const kindByName = classifyByName(name, att.content_type ?? "");
+  const meta = {
+    ticket_id: ticketId,
+    attachment_id: att.id,
+    name,
+    content_type: att.content_type ?? null,
+    size: att.size ?? null,
+    origin: hit.origin,
+    conversation_id: hit.conversation_id ?? null,
+    scan_state: att.scan_state ?? null,
+  };
+  const none = (extra: Record<string, unknown>) => ({ header: { ...meta, ...extra }, content: [] });
+
+  if (!kindEnabled(kindByName)) {
+    return none({
+      handling: DISABLED_HANDLING,
+      analysed: false,
+      reason: "type disabled by FRESHDESK_ATTACHMENT_TYPES (not downloaded)",
+    });
+  }
+  if (!willAnalyse(kindByName)) {
+    return none({
+      handling: HANDLING[kindByName],
+      analysed: false,
+      reason: `${HANDLING[kindByName]} (not downloaded)`,
+    });
+  }
+  if (!att.attachment_url) return none({ error: "Attachment has no download URL" });
+  if (att.size && att.size > MAX_FILE_BYTES) {
+    return none({
+      error: `File too large (${att.size} bytes, limit ${MAX_FILE_BYTES}). Raise FRESHDESK_MAX_ATTACHMENT_BYTES to allow it.`,
+    });
+  }
+
+  // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
+  const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
+  if (!dl.ok) return none({ error: `Download failed: ${dl.reason}` });
+
+  const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
+
+  const { content } = out;
+
+  // With no content, the first note is the reason: keep it once, as reason.
+  const reason = out.content.length ? undefined : out.notes[0];
+  const notes = reason ? out.notes.slice(1) : out.notes;
+  const header = {
+    ...meta,
+    downloaded_bytes: dl.bytes.length,
+    detected_kind: out.kind,
+    handling: out.handling ?? HANDLING[out.kind],
+    truncated: budget.truncated,
+    ...(notes.length ? { notes } : {}),
+    ...(reason ? { analysed: false, reason } : {}),
+  };
+  return { header, content };
+}
 
 export function registerAttachmentTools(server: McpServer) {
   tool(
     server,
+    "list_ticket_attachments",
+    "List every file attached to one or more tickets (description and all conversations) without downloading them: id, name, type, size, origin and how get_ticket_attachment will handle it. Videos, audio and executables are flagged as not analysed. Also counts inline images pasted in message bodies. Use name_contains to find a file across several tickets.",
+    {
+      ticket_ids: z.array(z.number().int()).min(1).max(25),
+      name_contains: z
+        .string()
+        .optional()
+        .describe("Only return attachments whose file name contains this text (case-insensitive)."),
+    },
+    async ({ ticket_ids, name_contains }): Promise<CallToolResult> => {
+      const filter = name_contains?.toLowerCase();
+      const results = [];
+      for (const ticket_id of ticket_ids) {
+        const found = await collectAttachments(ticket_id);
+        if (!found.ok) {
+          results.push({ ticket_id, error: found.error });
+          continue;
+        }
+        const attachments = found.items
+          .filter((c) => !filter || (c.att.name ?? "").toLowerCase().includes(filter))
+          .map((c) => {
+            const kind = classifyByName(c.att.name ?? "", c.att.content_type ?? "");
+            return {
+              id: c.att.id,
+              name: c.att.name,
+              content_type: c.att.content_type,
+              size: c.att.size,
+              created_at: c.att.created_at,
+              origin: c.origin,
+              conversation_id: c.conversation_id ?? null,
+              handling: !kindEnabled(kind)
+                ? DISABLED_HANDLING
+                : isGifName(c.att.name ?? "", c.att.content_type ?? "")
+                  ? GIF_LIST_HANDLING
+                  : HANDLING[kind],
+              analysed: willAnalyse(kind),
+            };
+          });
+        const counts: Record<string, number> = {};
+        for (const a of attachments) counts[a.handling] = (counts[a.handling] ?? 0) + 1;
+        results.push({
+          ticket_id,
+          attachment_count: attachments.length,
+          by_handling: counts,
+          inline_image_count: filter ? undefined : found.inlineImages,
+          attachments,
+        });
+      }
+      return text(ticket_ids.length === 1 ? results[0] : { tickets: results });
+    },
+  );
+
+  tool(
+    server,
     "get_ticket_attachment",
-    "Read a file attachment from a ticket or any of its conversations. PNG, JPEG, GIF and WebP images are returned as image content and text files (log, txt, json, xml, csv, yaml, har, ...) as text. Other files (PDF, Office documents, archives, video, other image formats) cannot be read by the model: the tool returns their metadata and detected type instead, unless include_raw is true. Attachment ids come from get_ticket or get_ticket_conversation.",
+    "Read one file attached to a ticket or any of its conversations and return what the model can use: text (PDF page by page, Word as Markdown, Excel/CSV as tables, PowerPoint slide text, emails with headers and attachment list, JSON, XML, logs), a request summary for HAR files, and images (PNG/JPEG/static GIF/WebP, other formats converted, PDF pages with images or without text rendered). ZIP archives are listed and their files processed with the same rules. Videos and animated GIFs are not analysed. The response is kept under the client size limit (about 1 MB), and says when pages or images did not fit. Attachment ids come from list_ticket_attachments.",
     {
       ticket_id: z.number().int(),
       attachment_id: z.number().int(),
-      max_text_chars: z
-        .number()
-        .int()
-        .min(1000)
-        .optional()
-        .default(100_000)
-        .describe("Text files longer than this are truncated (default 100000 characters)."),
-      include_raw: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe(
-          "Return files that are not text or a supported image as an embedded base64 resource. Only useful for clients that can handle binary resources (default false).",
-        ),
+      ...LIMIT_PARAMS,
     },
-    async ({ ticket_id, attachment_id, max_text_chars, include_raw }): Promise<CallToolResult> => {
+    async ({ ticket_id, attachment_id, ...limits }): Promise<CallToolResult> => {
       // Re-read the ticket every time: attachment URLs are signed and expire.
-      const t = await fetchTicket(ticket_id);
-      if (!t.ok) return text(errorPayload("Failed to fetch ticket", t.res));
-
-      const candidates: { att: FdAttachment; origin: string; conversation_id?: number }[] = (
-        t.ticket.attachments ?? []
-      ).map((att) => ({ att, origin: "ticket" }));
-
-      let found = candidates.find((c) => c.att.id === attachment_id);
-      if (!found) {
-        const conv = await fetchAllConversations(ticket_id);
-        if (!conv.ok) return text(errorPayload("Failed to fetch conversations", conv.res));
-        for (const c of conv.conversations) {
-          for (const att of c.attachments ?? []) {
-            candidates.push({ att, origin: conversationOrigin(c), conversation_id: c.id });
-          }
-        }
-        found = candidates.find((c) => c.att.id === attachment_id);
-      }
-
-      if (!found) {
+      const found = await collectAttachments(ticket_id);
+      if (!found.ok) return text({ error: found.error });
+      const hit = found.items.find((c) => c.att.id === attachment_id);
+      if (!hit) {
         return text({
           error: `Attachment ${attachment_id} not found on ticket ${ticket_id}`,
-          available_attachments: candidates.map((c) => ({
+          available_attachments: found.items.map((c) => ({
             id: c.att.id,
             name: c.att.name,
-            content_type: c.att.content_type,
-            size: c.att.size,
             origin: c.origin,
-            conversation_id: c.conversation_id,
           })),
         });
       }
-
-      const { att } = found;
-      const name = att.name ?? `attachment-${att.id}`;
-      const meta = {
-        ticket_id,
-        attachment_id: att.id,
-        name,
-        content_type: att.content_type ?? null,
-        size: att.size ?? null,
-        origin: found.origin,
-        conversation_id: found.conversation_id ?? null,
-      };
-
-      if (!att.attachment_url) return text({ ...meta, error: "Attachment has no download URL" });
-
-      const ext = extension(name);
-      const declaredType = (att.content_type ?? "application/octet-stream")
-        .split(";")[0]
-        .trim()
-        .toLowerCase();
-      const notReadable = (detectedType: string | null) =>
-        text({
-          ...meta,
-          detected_type: detectedType ?? declaredType,
-          readable: false,
-          reason:
-            "This file type cannot be read by the model. Only text files and PNG, JPEG, GIF or WebP images are returned as content.",
-          hint: "Pass include_raw: true to receive the file as a base64 resource if your client can handle binary files.",
-        });
-
-      // Skip the download entirely for types we would not return anyway.
-      const declaredNonReadable =
-        NON_READABLE_EXTENSIONS.has(ext) ||
-        /^(video|audio)\//.test(declaredType) ||
-        declaredType === "application/pdf" ||
-        declaredType.includes("officedocument") ||
-        declaredType.includes("msword") ||
-        declaredType.includes("ms-excel") ||
-        declaredType.includes("zip");
-      if (declaredNonReadable && !include_raw) return notReadable(null);
-
-      if (att.size && att.size > MAX_FILE_BYTES) {
-        return text({
-          ...meta,
-          error: `File too large (${att.size} bytes, limit ${MAX_FILE_BYTES}). Raise FRESHDESK_MAX_ATTACHMENT_BYTES to allow it.`,
-        });
-      }
-
-      // attachment_url comes from the Freshdesk API, so S3 hosts are accepted here.
-      const dl = await download(att.attachment_url, MAX_FILE_BYTES, true);
-      if (!dl.ok) return text({ ...meta, error: `Download failed: ${dl.reason}` });
-
-      const detected = sniffFileType(dl.bytes);
-      const header: Content = {
-        type: "text",
-        text: JSON.stringify(
-          { ...meta, detected_type: detected ?? declaredType, downloaded_bytes: dl.bytes.length },
-          null,
-          2,
-        ),
-      };
-
-      if (detected && SUPPORTED_IMAGE_TYPES.has(detected)) {
-        return {
-          content: [
-            header,
-            { type: "image", data: dl.bytes.toString("base64"), mimeType: detected },
-          ],
-        };
-      }
-
-      const textCandidate =
-        !detected &&
-        !looksBinary(dl.bytes) &&
-        (isTextLike(declaredType, name) || declaredType === "application/octet-stream");
-      if (textCandidate) {
-        const body = dl.bytes.toString("utf8");
-        const truncated = body.length > max_text_chars;
-        return {
-          content: [
-            header,
-            {
-              type: "text",
-              text: truncated
-                ? `${body.slice(0, max_text_chars)}\n\n[truncated: showing ${max_text_chars} of ${body.length} characters]`
-                : body,
-            },
-          ],
-        };
-      }
-
-      if (!include_raw) return notReadable(detected);
-
+      const budget = budgetFrom(limits);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
+      const read = await readAttachment(ticket_id, hit, budget);
+      const header: Record<string, unknown> = { ...read.header };
+      const { content } = read;
+      if (budget.imagesStopped)
+        header.not_returned =
+          "Some pages or images did not fit in this response (the client limit is about 1 MB).";
+      if (content.length === 0) return text(header);
       return {
-        content: [
-          header,
-          {
-            type: "resource",
-            resource: {
-              uri: `freshdesk://tickets/${ticket_id}/attachments/${att.id}/${encodeURIComponent(name)}`,
-              mimeType: detected ?? declaredType,
-              blob: dl.bytes.toString("base64"),
-            },
-          },
-        ],
+        content: enforceResponseSize(
+          mergeTextBlocks([
+            { type: "text", text: JSON.stringify(header, null, 2) },
+            { type: "text", text: UNTRUSTED_NOTICE },
+            ...content,
+          ]),
+        ),
       };
     },
   );
@@ -621,9 +614,9 @@ export function registerAttachmentTools(server: McpServer) {
         .int()
         .min(0)
         .optional()
-        .default(100)
+        .default(MIN_IMAGE_DIMENSION)
         .describe(
-          "Skip images whose width AND height are both below this many pixels (signatures, logos, icons). 0 disables the filter.",
+          `Skip images whose width AND height are both below this many pixels (signatures, logos, icons). 0 disables the filter. Default ${MIN_IMAGE_DIMENSION} (FRESHDESK_MIN_IMAGE_DIMENSION).`,
         ),
     },
     async ({
@@ -632,6 +625,8 @@ export function registerAttachmentTools(server: McpServer) {
       max_images,
       min_dimension,
     }): Promise<CallToolResult> => {
+      if (!kindEnabled("image"))
+        return text({ ticket_id, error: "Images are disabled by FRESHDESK_ATTACHMENT_TYPES" });
       const t = await fetchTicket(ticket_id);
       if (!t.ok) return text(errorPayload("Failed to fetch ticket", t.res));
 
@@ -664,6 +659,14 @@ export function registerAttachmentTools(server: McpServer) {
       const skipped: { src: string; origin: string; conversation_id?: number; reason: string }[] =
         [];
       const returned: Record<string, unknown>[] = [];
+      let imageBlocks = 0;
+      // Keeps the whole response under the client size limit (images recompressed if needed).
+      const sizeBudget = new Budget({
+        maxTextChars: 20_000,
+        maxPages: 0,
+        maxImages: max_images,
+        harRaw: false,
+      });
       const images: Content[] = [];
       const seenUrls = new Set<string>();
       const seenHashes = new Set<string>();
@@ -678,7 +681,7 @@ export function registerAttachmentTools(server: McpServer) {
             reason,
           });
 
-        if (returned.length >= max_images) {
+        if (imageBlocks >= max_images) {
           skip("max_images reached");
           continue;
         }
@@ -718,11 +721,16 @@ export function registerAttachmentTools(server: McpServer) {
           bytes = dl.bytes;
         }
 
-        const mime = sniffImageType(bytes);
+        let mime = sniffImageType(bytes);
         if (!mime) {
-          const other = sniffFileType(bytes);
-          skip(other ? `unsupported image format (${other})` : "not a supported image format");
-          continue;
+          // BMP, TIFF and HEIC are converted. Anything else is not an image we can show.
+          const converted = await toSupportedImage(bytes);
+          if (!converted) {
+            skip("not a supported image format");
+            continue;
+          }
+          bytes = converted.data;
+          mime = converted.mimeType;
         }
 
         const hash = createHash("sha256").update(bytes).digest("hex");
@@ -743,11 +751,31 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
 
+        // Animated GIFs (screen recordings) are handled like videos: not analysed.
+        if (mime === "image/gif" && isAnimatedGif(bytes)) {
+          skip(ANIMATED_GIF_HANDLING);
+          continue;
+        }
+
+        // Shrink very large screenshots so they fit the model's image limits.
+        const fitted = await toSupportedImage(bytes);
+        if (fitted) {
+          bytes = fitted.data;
+          mime = fitted.mimeType;
+        }
+
         if (totalBytes + bytes.length > MAX_TOTAL_BYTES) {
           skip(`total size limit reached (${MAX_TOTAL_BYTES} bytes per call)`);
           continue;
         }
         totalBytes += bytes.length;
+        const fit = await sizeBudget.fitImage(bytes, mime);
+        if (!fit) {
+          skip("response size limit reached");
+          continue;
+        }
+        bytes = fit.data;
+        mime = fit.mimeType;
 
         const index = returned.length + 1;
         const info = {
@@ -761,12 +789,11 @@ export function registerAttachmentTools(server: McpServer) {
           width: size?.width ?? null,
           height: size?.height ?? null,
         };
+        const label = `Image ${index}: ${s.origin}${s.conversation_id ? ` (conversation ${s.conversation_id})` : ""}${s.created_at ? `, ${s.created_at}` : ""}`;
         returned.push(info);
-        images.push({
-          type: "text",
-          text: `Image ${index}: ${s.origin}${s.conversation_id ? ` (conversation ${s.conversation_id})` : ""}${s.created_at ? `, ${s.created_at}` : ""}`,
-        });
+        images.push({ type: "text", text: label });
         images.push({ type: "image", data: bytes.toString("base64"), mimeType: mime });
+        imageBlocks++;
       }
 
       const summary = {
@@ -777,7 +804,11 @@ export function registerAttachmentTools(server: McpServer) {
         images: returned,
         skipped_details: skipped,
       };
-      return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }, ...images] };
+      return {
+        content: enforceResponseSize(
+          mergeTextBlocks([{ type: "text", text: JSON.stringify(summary, null, 2) }, ...images]),
+        ),
+      };
     },
   );
 }
