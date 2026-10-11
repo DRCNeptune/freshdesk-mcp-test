@@ -1,7 +1,7 @@
 {
   "name": "freshdesk-mcp",
   "version": "1.1.1",
-  "description": "MCP server for Freshdesk (TypeScript) \u2014 supports stdio and Streamable HTTP transports",
+  "description": "MCP server for Freshdesk (TypeScript) — supports stdio and Streamable HTTP transports",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -52,8 +52,11 @@
   "dependencies": {
     "@kenjiuno/msgreader": "1.28.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/canvas": "0.1.65",
     "express": "^4.21.2",
     "fflate": "0.8.3",
+    "heic-convert": "2.1.0",
+    "jimp": "1.6.1",
     "mammoth": "1.13.0",
     "papaparse": "5.5.3",
     "pdfjs-dist": "4.4.168",

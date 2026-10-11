@@ -94,7 +94,7 @@
 
 All attachment tools re-read the ticket on every call because attachment URLs are pre-signed and expire. Downloads never send Freshdesk credentials, only use HTTPS, only reach hosts in `FRESHDESK_ATTACHMENT_HOSTS` (checked again on every redirect; `attachment_url` values returned by the Freshdesk API may also use `amazonaws.com`, where older attachments are stored) and are capped by `FRESHDESK_MAX_ATTACHMENT_BYTES`. Attachments are never executed or written to disk, and extracted content is labelled as untrusted for the model. See [CONFIGURATION.md](CONFIGURATION.md).
 
-Rendering PDF pages (scanned pages, or pages with images) and converting or resizing images (BMP, TIFF, HEIC, very large images) use optional dependencies: `@napi-rs/canvas`, `jimp` and `heic-convert`, about 100 MB together. They are not installed by default. Without them, text is still extracted from every format and supported images are returned as they are, and the output says which optional dependency is missing. To enable them: `npm install @napi-rs/canvas jimp heic-convert`.
+Rendering PDF pages (scanned pages, or pages with images) and converting or resizing images (BMP, TIFF, HEIC, very large images) use `@napi-rs/canvas`, `jimp` and `heic-convert`, about 100 MB together. They are loaded only when needed and the code works without them: if they are removed, text is still extracted from every format and supported images are returned as they are, and the output says which dependency is missing.
 
 ## Ticket Summary
 
