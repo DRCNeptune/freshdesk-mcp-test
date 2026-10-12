@@ -254,7 +254,7 @@ Pass intentionally bad input and confirm Zod rejects it before any HTTP call:
 - TypeScript ESM (`"type": "module"`, `Node16` module resolution).
 - 2-space indent, double quotes, semicolons.
 - Prefer narrow Zod schemas in `src/schemas/` over inline `z.record(z.any())` so input gets validated, not just typed.
-- Keep tool descriptions short (one sentence, imperative). Clients display them in tool pickers.
+- Tool descriptions are written for the model: what the tool does, when to use it vs. siblings, key payload fields/enums, and gotchas. Per-field hints go in `.describe()`.
 - Error responses follow the convention:
   ```ts
   return text({ error: "Failed to do X", details: res.data });
@@ -288,6 +288,10 @@ release-please derives the next version from [Conventional Commits](https://www.
 | `feat!:` or `BREAKING CHANGE:` footer | major (**2**.0.0) |
 | `docs:`, `chore:`, `refactor:`, `test:`, `ci:` | no release |
 
-### Manual publish (emergency / beta)
+### npm authentication (trusted publishing)
 
-Use the **Publish (manual)** workflow in GitHub Actions (`workflow_dispatch`) and set the desired `dist-tag` (e.g. `beta`, `next`). This should only be needed for out-of-band releases.
+Publishing uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC) — there is no `NPM_TOKEN` secret to rotate. On npmjs.com, package `freshdesk-mcp` → Settings → Trusted Publisher is set to GitHub Actions, repo `hashcott/freshdesk-mcp`, workflow `release-please.yml`. npm allows one trusted workflow per package, so **all** publishing must go through that file.
+
+### Manual publish (re-publish / beta)
+
+Run the **Release** workflow manually (Actions → Release → Run workflow, or `gh workflow run release-please.yml -f tag=beta`) and pick the dist-tag. It publishes the version currently in `package.json` on the selected branch — use it to retry a failed publish or for out-of-band `beta` / `next` releases.
