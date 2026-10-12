@@ -34,6 +34,7 @@ export function registerContactTools(server: McpServer) {
         .optional()
         .describe("Contact state."),
       updated_since: z.string().optional().describe("ISO-8601 UTC timestamp."),
+      contact_type: z.enum(["contact", "visitor"]).optional().describe("Filter by contact type."),
     },
     async (args) => {
       const res = await fd.get("/contacts", args);
@@ -84,8 +85,10 @@ export function registerContactTools(server: McpServer) {
   tool(
     server,
     "create_contact",
-    "Create a contact. Required: name and one of email | phone | mobile | twitter_id | unique_external_id. " +
-      "Optional: company_id, other_companies[{company_id, view_all_tickets}], job_title, language, time_zone, address, description, tags[], custom_fields{}.",
+    "Create a contact. Required: name and one of email | phone | mobile | twitter_id | unique_external_id | social_handler[] " +
+      "(up to 10 Facebook/Instagram/X handles). " +
+      "Optional: other_emails[], company_id, view_all_tickets, other_companies[{company_id, view_all_tickets}], job_title, language, time_zone, " +
+      "address, description, tags[], custom_fields{}, lookup_parameter.",
     { contact: z.record(z.any()).describe("Contact payload.") },
     async ({ contact }) => {
       const v = validate(ContactCreate, contact);
@@ -98,7 +101,8 @@ export function registerContactTools(server: McpServer) {
   tool(
     server,
     "update_contact",
-    "Partially update a contact; only sent keys change. Setting tags or other_companies replaces the whole list.",
+    "Partially update a contact; only sent keys change (same fields as create_contact, incl. social_handler[], other_emails[], lookup_parameter). " +
+      "Setting tags, other_emails or other_companies replaces the whole list.",
     { contact_id: contactId, contact: z.record(z.any()).describe("Fields to change.") },
     async ({ contact_id, contact }) => {
       const v = validate(ContactUpdate, contact);
@@ -165,7 +169,8 @@ export function registerContactTools(server: McpServer) {
     server,
     "merge_contacts",
     "Merge duplicate contacts into a primary one; secondaries' tickets move to the primary and secondaries are deleted. " +
-      "Payload: primary_contact_id, secondary_contact_ids[], contact?{email, phone, mobile, company_ids, other_emails…} to pick final values.",
+      "Payload: primary_contact_id, secondary_contact_ids[], contact?{email, phone, mobile, twitter_id, unique_external_id, other_emails[], company_ids[]} " +
+      "to pick the merged contact's final values.",
     { merge: z.record(z.any()).describe("Merge payload.") },
     async ({ merge }) => {
       const v = validate(ContactsMerge, merge);
@@ -179,7 +184,7 @@ export function registerContactTools(server: McpServer) {
     server,
     "make_agent",
     "Convert a contact (must have an email) into an agent. Optional agent settings: occasional, ticket_scope (1=global 2=group 3=restricted), " +
-      "group_ids[], role_ids[], skill_ids[], signature, type ('support_agent' | 'field_agent' | 'collaborator').",
+      "group_ids[], contribution_group_ids[], skill_ids[], signature, focus_mode, type ('support_agent' | 'field_agent' | 'collaborator').",
     {
       contact_id: contactId,
       agent: z.record(z.any()).optional().describe("Optional agent settings."),
@@ -307,6 +312,7 @@ export function registerContactTools(server: McpServer) {
     "create_contact_field",
     "Admin: create a custom contact field. Required: label, label_for_customers, type ('custom_text' | 'custom_paragraph' | " +
       "'custom_checkbox' | 'custom_number' | 'custom_dropdown' | 'custom_phone_number' | 'custom_url' | 'custom_date'). " +
+      "Also required: agents_can_edit, displayed_for_agents, quick_add_for_agent, unique (booleans). " +
       "Optional: position, required_for_agents, customers_can_edit, required_for_customers, displayed_for_customers, editable_in_signup, choices[].",
     { contact_field: z.record(z.any()).describe("Contact field payload.") },
     async ({ contact_field }) => {

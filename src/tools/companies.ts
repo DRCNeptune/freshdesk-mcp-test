@@ -20,9 +20,9 @@ export function registerCompanyTools(server: McpServer) {
     server,
     "list_companies",
     "List companies (customer organisations) with pagination. Returns { companies, pagination }.",
-    pageArgs,
-    async ({ page, per_page }) => {
-      const res = await fd.get("/companies", { page, per_page });
+    { ...pageArgs, updated_since: z.string().optional().describe("ISO-8601 UTC timestamp.") },
+    async ({ page, per_page, updated_since }) => {
+      const res = await fd.get("/companies", { page, per_page, updated_since });
       if (!res.ok) return text(errorPayload("Failed to list companies", res));
       const pagination = parseLinkHeader(res.headers.get("link"));
       return text({
@@ -224,7 +224,8 @@ export function registerCompanyTools(server: McpServer) {
     server,
     "create_company_field",
     "Admin: create a custom company field. Required: label, type ('custom_text' | 'custom_paragraph' | 'custom_checkbox' | " +
-      "'custom_number' | 'custom_dropdown' | 'custom_phone_number' | 'custom_url' | 'custom_date'). Optional: position, required_for_agents, choices[].",
+      "'custom_number' | 'custom_dropdown' | 'custom_phone_number' | 'custom_url' | 'custom_date'), agents_can_edit, displayed_for_agents, " +
+      "quick_add_for_agent, unique (booleans). Optional: position, required_for_agents, choices[].",
     { company_field: z.record(z.any()).describe("Company field payload.") },
     async ({ company_field }) => {
       const v = validate(CompanyFieldCreate, company_field);

@@ -5,6 +5,7 @@ import {
   ConversationUpdate,
   NoteCreate,
   ReplyCreate,
+  ReplyToForwardCreate,
   TicketBulkDeleteAction,
   TicketBulkUpdateAction,
   TicketCreate,
@@ -189,8 +190,9 @@ export function registerTicketTools(server: McpServer) {
     "create_ticket",
     "Create a ticket. Required: a requester identifier (email | requester_id | phone | twitter_id | facebook_id | unique_external_id) " +
       "and subject/description. Common fields: subject, description (HTML), status, priority, source, type, group_id, responder_id, " +
-      `company_id, tags[], cc_emails[], custom_fields{cf_*}, due_by, fr_due_by, parent_id (child ticket). ${ENUMS_HINT} ` +
-      "Note 'type' is a top-level field, not a custom field. Unknown keys are passed through.",
+      `company_id, product_id, email_config_id, internal_agent_id, internal_group_id, tags[], cc_emails[], custom_fields{cf_*}, due_by, fr_due_by, ` +
+      `lookup_parameter, parent_id (create as child), related_ticket_ids[] (create as tracker). ${ENUMS_HINT} ` +
+      "Note 'type' is a top-level field, not a custom field. File attachments need multipart upload and are not supported here.",
     { ticket: z.record(z.any()).describe("Ticket payload as a JSON object.") },
     async ({ ticket }) => {
       const v = validate(TicketCreate, ticket);
@@ -286,7 +288,8 @@ export function registerTicketTools(server: McpServer) {
     server,
     "create_ticket_reply",
     "Send a public reply to the requester (emails them). Payload: body (HTML, required), optional cc_emails[], bcc_emails[], " +
-      "from_email (must be a configured support email), user_id (agent sending). Use create_ticket_note for internal comments.",
+      "from_email (must be a configured support email), user_id (agent sending). Use create_ticket_note for internal comments. " +
+      "File attachments (multipart) are not supported.",
     {
       ticket_id: ticketId,
       reply: z.record(z.any()).describe("Reply payload, e.g. { body: '<p>Hi…</p>' }."),
@@ -303,7 +306,8 @@ export function registerTicketTools(server: McpServer) {
     server,
     "create_ticket_note",
     "Add a note to a ticket. Payload: body (HTML, required), private (default true — internal, not visible to requester), " +
-      "notify_emails[] (agent emails to notify), incoming (true = appears as from the requester), user_id.",
+      "notify_emails[] (agent emails to notify), incoming (true = appears as from the requester), user_id. " +
+      "File attachments (multipart) are not supported.",
     {
       ticket_id: ticketId,
       note: z.record(z.any()).describe("Note payload, e.g. { body: '…', private: true }."),
@@ -351,8 +355,8 @@ export function registerTicketTools(server: McpServer) {
   tool(
     server,
     "forward_ticket",
-    "Forward a ticket by email to third parties. Payload: body (HTML), to_emails[] (required), cc_emails[], bcc_emails[], from_email, " +
-      "include_quoted_text, include_original_attachments.",
+    "Forward a ticket by email to third parties. Required: body (HTML), to_emails[]. Optional: body_text, cc_emails[], bcc_emails[], " +
+      "from_email, agent_id, include_quoted_text, include_original_attachments.",
     { ticket_id: ticketId, forward: z.record(z.any()).describe("Forward payload.") },
     async ({ ticket_id, forward }) => {
       const v = validate(TicketForward, forward);
@@ -365,10 +369,13 @@ export function registerTicketTools(server: McpServer) {
   tool(
     server,
     "reply_to_forward",
-    "Reply to a third party on a previously forwarded thread. Payload: body (HTML, required), to_emails[], cc_emails[], bcc_emails[], from_email.",
-    { ticket_id: ticketId, reply: z.record(z.any()).describe("Reply payload.") },
+    "Reply to a third party on a previously forwarded thread. Required: body (HTML), to_emails[]. Optional: body_text, user_id.",
+    {
+      ticket_id: ticketId,
+      reply: z.record(z.any()).describe("{ body, to_emails, body_text?, user_id? }"),
+    },
     async ({ ticket_id, reply }) => {
-      const v = validate(ReplyCreate, reply);
+      const v = validate(ReplyToForwardCreate, reply);
       if (!v.ok) return v.reply;
       const res = await fd.post(`/tickets/${ticket_id}/reply_to_forward`, v.data);
       return text(res.ok ? res.data : errorPayload("Failed to reply to forward", res));
@@ -461,7 +468,8 @@ export function registerTicketTools(server: McpServer) {
     "create_ticket_field",
     "Admin: create a custom ticket field. Required: label, type ('custom_text' | 'custom_paragraph' | 'custom_checkbox' | 'custom_number' | " +
       "'custom_decimal' | 'custom_date' | 'custom_dropdown' | 'nested_field'). Optional: label_for_customers, required_for_agents, " +
-      "required_for_customers, required_for_closure, displayed_to_customers, customers_can_edit, position, choices[].",
+      "required_for_customers, required_for_closure, displayed_to_customers, customers_can_edit, position, choices[], " +
+      "dependent_fields[] (nested_field levels), section_mappings[].",
     { ticket_field: z.record(z.any()).describe("Ticket field payload.") },
     async ({ ticket_field }) => {
       const v = validate(TicketFieldCreate, ticket_field);
@@ -711,8 +719,9 @@ export function registerTicketTools(server: McpServer) {
   tool(
     server,
     "bulk_update_tickets",
-    "Update up to 100 tickets asynchronously. Payload: { ids: number[], properties?: {status, priority, group_id, responder_id, type, tags, custom_fields…}, " +
-      "reply?: { body } }. Changing internal agent/group also requires status. Returns a job_id — poll view_job_status.",
+    "Update up to 100 tickets asynchronously. Payload: { ids: number[], properties?: {status, priority, source, type, group_id, responder_id, " +
+      "product_id, email_config_id, requester_id, parent_id, due_by, fr_due_by, tags, custom_fields, internal_agent_id, internal_group_id, " +
+      "skip_close_notification…}, reply?: { body, from_email? } }. Changing internal agent/group also requires status. Returns a job_id — poll view_job_status.",
     { bulk_action: z.record(z.any()).describe("{ ids, properties?, reply? }") },
     async ({ bulk_action }) => {
       const v = validate(TicketBulkUpdateAction, bulk_action);

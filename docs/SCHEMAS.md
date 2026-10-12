@@ -170,9 +170,8 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 | status * | number | Status of the ticket (see `TicketStatusEnum`). Default: `2` (Open). |
 | priority * | number | Priority of the ticket (see `TicketPriorityEnum`). Default: `1` (Low). |
 | description | string | HTML content of the ticket. |
-| description_text | string | Plain-text content of the ticket. |
 | responder_id | number | ID of the agent to whom the ticket has been assigned. |
-| attachments | array of objects | Ticket attachments. Total size cannot exceed **20 MB**. |
+| attachments | array of objects | Ticket attachments (multipart upload — not supported by this server). |
 | cc_emails | array of strings | Email addresses added in the 'cc' field of the incoming ticket email. |
 | custom_fields | dictionary | Key/value pairs containing the names and values of custom fields. |
 | due_by | datetime | Response will be `null` unless provided. Auto-computed within seconds of creation. |
@@ -180,6 +179,7 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 | fr_due_by | datetime | First-response due timestamp. Same null/auto behaviour as `due_by`. |
 | group_id | number | ID of the group to which the ticket has been assigned. Defaults to the group associated with the given `email_config_id`. |
 | parent_id | number | ID of the parent ticket. Setting this converts the current ticket into a child. |
+| related_ticket_ids | array of numbers | Create the ticket as a **tracker** linked to these tickets (create only). |
 | product_id | number | ID of the product the ticket is associated with. Ignored if `email_config_id` is set. |
 | source * | number | Channel through which the ticket was created (see `TicketSourceEnum`). Default: `2` (Portal). |
 | tags | array of strings | Tags associated with the ticket. |
@@ -191,7 +191,7 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 **Refinements (enforced locally before HTTP):**
 
 1. Must provide **one of**: `email`, `requester_id`, `facebook_id`, `phone`, `twitter_id`, `unique_external_id`.
-2. Must provide **at least one of**: `subject`, `description`, `description_text`.
+2. Must provide **at least one of**: `subject`, `description`.
 
 ### Update a Ticket — `TicketUpdate`
 
@@ -259,6 +259,17 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 | cc_emails | array of strings | CC recipients of the reply. |
 | bcc_emails | array of strings | BCC recipients of the reply. |
 
+### Reply to Forward — `ReplyToForwardCreate`
+
+`POST /api/v2/tickets/[id]/reply_to_forward` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#reply_to_forward)
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| body * | string | HTML content of the reply. |
+| to_emails * | array of strings | Third-party recipients (≥1). |
+| body_text | string | Plain-text content. |
+| user_id | number | ID of the agent replying. |
+
 ### Create a Note — `NoteCreate`
 
 `POST /api/v2/tickets/[id]/notes` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#add_note_to_a_ticket)
@@ -314,6 +325,8 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 |-----------|------|-------------|
 | name * | string | Name of the contact. |
 | email † | string | Primary email address. |
+| other_emails | array of strings | Additional emails of the contact. |
+| social_handler † | array of objects | Up to 10 Facebook / Instagram / X handles. |
 | phone † | string | Telephone number. |
 | mobile † | string | Mobile number. |
 | twitter_id † | string | Twitter handle. |
@@ -331,7 +344,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 | custom_fields | dictionary | Custom contact fields. |
 | avatar | file | Profile image (multipart upload only — JSON callers should omit). |
 
-**Refinements:** `name` required; **at least one of** `email`, `phone`, `mobile`, `twitter_id`, `unique_external_id`.
+**Refinements:** `name` required; **at least one of** `email`, `phone`, `mobile`, `twitter_id`, `unique_external_id`, `social_handler`.
 
 ### Update a Contact — `ContactUpdate`
 
@@ -383,7 +396,13 @@ Same shape, all fields optional, no refinements.
 | customers_can_edit | boolean | Whether customers can edit in the portal. Default: `false`. |
 | required_for_customers | boolean | Mandatory in the customer portal. Default: `false`. |
 | displayed_for_customers | boolean | Whether visible in the customer portal. Default: `false`. |
+| agents_can_edit * | boolean | Whether agents can edit the field. |
+| displayed_for_agents * | boolean | Whether the field is shown to agents. |
+| quick_add_for_agent * | boolean | Show in the agent quick-add form. |
+| unique * | boolean | Values must be unique across records. |
 | choices | array | Choices for `custom_dropdown` — each `{ value, position? }`. |
+
+`*` fields are required on create (`ContactFieldCreate`); all fields are optional on update.
 
 ---
 
@@ -424,11 +443,16 @@ Same shape; all fields optional.
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | label * | string | Display name. |
-| label_for_customers | string | Display name visible to customers. |
 | type * | string | Field type — same vocabulary as contact fields. |
 | position | integer | Display position. |
 | required_for_agents | boolean | Mandatory for agents. |
+| agents_can_edit * | boolean | Whether agents can edit the field. |
+| displayed_for_agents * | boolean | Whether the field is shown to agents. |
+| quick_add_for_agent * | boolean | Show in the agent quick-add form. |
+| unique * | boolean | Values must be unique across records. |
 | choices | array | Choices for dropdown / multi-select. |
+
+`*` fields are required on create (`CompanyFieldCreate`); all fields are optional on update.
 
 ---
 
@@ -604,8 +628,9 @@ Update variants (`SolutionCategoryUpdate` / `SolutionFolderUpdate` / `SolutionAr
 | name * | string | Name of the forum. |
 | description | string | Description of the forum. |
 | forum_type * | integer | `1` = Howto, `2` = Ideas, `3` = Problems, `4` = Announcements. |
-| forum_visibility | integer | `1` = All, `2` = Logged-in users, `3` = Agents only, `4` = Selected companies. |
-| customer_ids | array of integers | Required when `forum_visibility = 4`. |
+| forum_visibility * | integer | `1` = All, `2` = Logged-in users, `3` = Agents only, `4` = Selected companies. |
+| company_ids | array of integers | Companies that can see the forum when `forum_visibility = 4`. |
+| forum_category_id | integer | Update only: move the forum to another category. |
 
 ### Create a Topic — `TopicCreate`
 
@@ -614,7 +639,8 @@ Update variants (`SolutionCategoryUpdate` / `SolutionFolderUpdate` / `SolutionAr
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | title * | string | Title of the topic. |
-| message_html * | string | HTML body of the first post. |
+| message * | string | HTML body of the first post. |
+| forum_id | integer | Update only: move the topic to another forum. |
 | sticky | boolean | Pin the topic to the top of the forum. |
 | locked | boolean | Lock the topic against new replies. |
 | stamp_type | integer | Stamp / status integer (forum-type specific, e.g. "Planned", "Implemented", "Already exists"). |
@@ -625,8 +651,8 @@ Update variants (`SolutionCategoryUpdate` / `SolutionFolderUpdate` / `SolutionAr
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| body_html * | string | HTML content of the comment. |
-| answer | boolean | Mark this comment as the accepted answer. |
+| body * | string | HTML content of the comment. |
+| answer | boolean | Update only: mark this comment as the accepted answer. |
 
 Update variants share the same shape, fields optional.
 
@@ -693,14 +719,13 @@ See [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_sla_policy
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| name * | string | Mailbox name shown in Freshdesk. |
+| name | string | Mailbox name shown in Freshdesk. |
 | support_email * | string | The address customers email (e.g. `support@yourcompany.com`). |
-| forward_email | string | The address customer email is forwarded to (Freshdesk-provided). |
+| mailbox_type * | string enum | `"freshdesk_mailbox"` or `"custom_mailbox"`. |
 | group_id | integer | Default group for tickets received here. |
 | product_id | integer | Product associated with the mailbox. |
-| mailbox_type | string | Implementation kind, e.g. `"forward_email"`, `"custom_mailbox"`. |
-| active | boolean | Whether the mailbox is enabled. |
 | default_reply_email | boolean | Whether replies use this address as default. |
+| custom_mailbox | object | Required for `custom_mailbox`: `{ access_type: "incoming"\|"outgoing"\|"both", incoming: { mail_server, port, use_ssl, authentication, username, password }, outgoing: { … } }`. |
 
 ---
 
@@ -808,7 +833,8 @@ Service tasks are ordinary tickets with `type: "Service Task"` ([Freshdesk docs 
 | `TicketBulkDeleteAction`          | `bulk_delete_tickets`                                                                    |
 | `TicketMerge`                     | `merge_tickets`                                                                          |
 | `TicketForward`                   | `forward_ticket`                                                                         |
-| `ReplyCreate`                     | `create_ticket_reply`, `reply_to_forward`                                                |
+| `ReplyCreate`                     | `create_ticket_reply`                                                                    |
+| `ReplyToForwardCreate`            | `reply_to_forward`                                                                       |
 | `NoteCreate`                      | `create_ticket_note`                                                                     |
 | `ConversationUpdate`              | `update_ticket_conversation`                                                             |
 | `TicketFieldCreate/Update`        | `create_ticket_field`, `update_ticket_field`                                             |

@@ -8,10 +8,13 @@ const agentId = z.number().int().describe("Agent ID (not the contact ID).");
 const groupId = z.number().int().describe("Group ID.");
 const AGENT_FIELDS =
   "email (required on create), ticket_scope (1=global 2=group 3=restricted; required on create), occasional, signature, " +
-  "group_ids[], role_ids[], skill_ids[], agent_type, language, time_zone, focus_mode";
+  "group_ids[], contribution_group_ids[], role_ids[], skill_ids[], agent_type, language, time_zone, focus_mode";
 const GROUP_FIELDS =
-  "name (required on create), description, agent_ids[], auto_ticket_assign, escalate_to (agent ID), " +
-  "unassigned_for ('30m'|'1h'|'2h'|'4h'|'8h'|'12h'|'1d'|'2d'|'3d'), business_hour_id, allow_agents_to_change_availability";
+  "name (required on create), description, agent_ids[], auto_ticket_assign (0|1), escalate_to (agent ID), " +
+  "unassigned_for ('30m'|'1h'|'2h'|'4h'|'8h'|'12h'|'1d'|'2d'|'3d')";
+const ADMIN_GROUP_FIELDS =
+  "name, description, type ('support_agent_group'|'field_agent_group'), agent_ids[], escalate_to, unassigned_for, " +
+  "business_calendar_id, allow_agents_to_change_availability, automatic_agent_assignment{enabled, type, settings[]}";
 
 export function registerAgentTools(server: McpServer) {
   tool(
@@ -21,6 +24,8 @@ export function registerAgentTools(server: McpServer) {
     {
       ...pageArgs,
       email: z.string().email().optional().describe("Exact email filter."),
+      mobile: z.string().optional().describe("Exact mobile filter."),
+      phone: z.string().optional().describe("Exact phone filter."),
       state: z.enum(["fulltime", "occasional"]).optional().describe("Agent type filter."),
     },
     async (args) => {
@@ -78,7 +83,7 @@ export function registerAgentTools(server: McpServer) {
   tool(
     server,
     "bulk_create_agents",
-    "Create many agents in one async job (same fields as create_agent). Returns a job_id — poll view_job_status.",
+    "Create many agents in one async job. Each item: create_agent fields plus name, phone, mobile, job_title. Returns a job_id — poll view_job_status.",
     { agents: z.array(z.record(z.any())).min(1).describe("Agent payloads.") },
     async ({ agents }) => {
       const validated: any[] = [];
@@ -264,7 +269,7 @@ export function registerGroupTools(server: McpServer) {
   tool(
     server,
     "create_admin_group",
-    `Create a group via the admin API. Fields: ${GROUP_FIELDS}, plus routing settings (e.g. assignment_type) on Omni accounts.`,
+    `Create a group via the admin API. Fields: ${ADMIN_GROUP_FIELDS}.`,
     { group: z.record(z.any()).describe("Group payload.") },
     async ({ group }) => {
       const v = validate(GroupCreate, group);
@@ -277,7 +282,7 @@ export function registerGroupTools(server: McpServer) {
   tool(
     server,
     "update_admin_group",
-    "Update a group via the admin API; only sent keys change.",
+    `Update a group via the admin API; only sent keys change. Fields: ${ADMIN_GROUP_FIELDS}.`,
     { group_id: groupId, group: z.record(z.any()).describe("Fields to change.") },
     async ({ group_id, group }) => {
       const v = validate(GroupUpdate, group);

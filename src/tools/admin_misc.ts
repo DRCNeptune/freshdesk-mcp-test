@@ -229,17 +229,29 @@ export function registerEmailConfigTools(server: McpServer) {
 // ─── Email Mailboxes ─────────────────────────────
 const mailboxId = z.number().int().describe("Mailbox ID.");
 const MAILBOX_FIELDS =
-  "name, support_email, group_id, product_id, default_reply_email, mailbox_type ('freshdesk_mailbox'|'custom_mailbox'), " +
-  "custom_mailbox{access_type, incoming{…}, outgoing{…}} for custom IMAP/SMTP";
+  "support_email*, mailbox_type* ('freshdesk_mailbox'|'custom_mailbox'), name, group_id, product_id, default_reply_email, " +
+  "custom_mailbox{access_type ('incoming'|'outgoing'|'both'), incoming{mail_server, port, use_ssl, authentication, username, password}, " +
+  "outgoing{…same…}} (required for custom_mailbox)";
 
 export function registerMailboxTools(server: McpServer) {
   tool(
     server,
     "list_email_mailboxes",
     "List email mailboxes (support addresses with their routing group/product and IMAP/SMTP settings).",
-    {},
-    async () => {
-      const res = await fd.get("/email/mailboxes");
+    {
+      support_email: z.string().optional().describe("Exact support email."),
+      forward_email: z.string().optional().describe("Exact forward email."),
+      group_id: z.number().int().optional().describe("Mailboxes routing to this group."),
+      product_id: z.number().int().optional().describe("Mailboxes of this product."),
+      active: z.boolean().optional().describe("Only active (true) or inactive (false)."),
+      order_by: z
+        .enum(["product_id", "group_id"])
+        .optional()
+        .describe("Sort field (required when order_type is set)."),
+      order_type: z.enum(["asc", "desc"]).optional().describe("Sort direction."),
+    },
+    async (query) => {
+      const res = await fd.get("/email/mailboxes", query);
       return text(res.ok ? res.data : errorPayload("Failed to list mailboxes", res));
     },
   );
@@ -256,7 +268,7 @@ export function registerMailboxTools(server: McpServer) {
   tool(
     server,
     "create_email_mailbox",
-    `Create an email mailbox. Required: name, support_email. Fields: ${MAILBOX_FIELDS}.`,
+    `Create an email mailbox. Fields (* required): ${MAILBOX_FIELDS}.`,
     { mailbox: z.record(z.any()).describe("Mailbox payload.") },
     async ({ mailbox }) => {
       const v = validate(MailboxCreate, mailbox);

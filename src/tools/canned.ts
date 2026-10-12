@@ -61,7 +61,7 @@ export function registerCannedTools(server: McpServer) {
   tool(
     server,
     "create_canned_response",
-    `Create a canned response. Required: ${CANNED_FIELDS}.`,
+    `Create a canned response. Required: ${CANNED_FIELDS}. File attachments (multipart) are not supported.`,
     { canned_response: z.record(z.any()).describe("Canned response payload.") },
     async ({ canned_response }) => {
       const v = validate(CannedResponseCreate, canned_response);

@@ -100,8 +100,8 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "create_forum",
-    "Create a forum in a category. Payload: name, forum_type (1=how-to 2=ideas 3=problems 4=announcements) required; " +
-      "description, forum_visibility (1=all 2=logged-in 3=agents 4=selected companies), company_ids[].",
+    "Create a forum in a category. Required: name, forum_type (1=how-to 2=ideas 3=problems 4=announcements), " +
+      "forum_visibility (1=all 2=logged-in 3=agents 4=selected companies). Optional: description, company_ids[] (for visibility 4).",
     { category_id: forumCategoryId, forum: z.record(z.any()).describe("Forum payload.") },
     async ({ category_id, forum }) => {
       const v = validate(ForumCreate, forum);
@@ -113,7 +113,7 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "update_forum",
-    "Update a forum (name, description, forum_type, forum_visibility…).",
+    "Update a forum (name, description, forum_type, forum_visibility, company_ids[], forum_category_id to move it).",
     { forum_id: forumId, forum: z.record(z.any()).describe("Fields to change.") },
     async ({ forum_id, forum }) => {
       const v = validate(ForumUpdate, forum);
@@ -157,7 +157,7 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "create_topic",
-    "Create a topic in a forum. Payload: title, message_html (required), sticky, locked, stamp_type.",
+    "Create a topic in a forum. Payload: title, message (HTML) required; sticky, locked, stamp_type optional.",
     { forum_id: forumId, topic: z.record(z.any()).describe("Topic payload.") },
     async ({ forum_id, topic }) => {
       const v = validate(TopicCreate, topic);
@@ -169,7 +169,7 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "update_topic",
-    "Update a forum topic (title, message_html, sticky, locked, stamp_type).",
+    "Update a forum topic (title, message, sticky, locked, stamp_type, forum_id to move it).",
     { topic_id: topicId, topic: z.record(z.any()).describe("Fields to change.") },
     async ({ topic_id, topic }) => {
       const v = validate(TopicUpdate, topic);
@@ -203,7 +203,7 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "create_topic_comment",
-    "Comment on a forum topic. Payload: body_html (required), answer (mark as answer).",
+    "Comment on a forum topic. Payload: { body (HTML, required) }.",
     { topic_id: topicId, comment: z.record(z.any()).describe("Comment payload.") },
     async ({ topic_id, comment }) => {
       const v = validate(CommentCreate, comment);
@@ -215,7 +215,7 @@ export function registerDiscussionTools(server: McpServer) {
   tool(
     server,
     "update_topic_comment",
-    "Update a forum comment (body_html, answer).",
+    "Update a forum comment. Payload: { body?, answer? (true = mark as the topic's answer) }.",
     { comment_id: commentId, comment: z.record(z.any()).describe("Fields to change.") },
     async ({ comment_id, comment }) => {
       const v = validate(CommentUpdate, comment);
@@ -391,9 +391,9 @@ export function registerSurveyTools(server: McpServer) {
     server,
     "list_surveys",
     "List classic satisfaction surveys (legacy engine) and their questions.",
-    {},
-    async () => {
-      const res = await fd.get("/surveys");
+    { state: z.enum(["active"]).optional().describe("Only the active survey.") },
+    async ({ state }) => {
+      const res = await fd.get("/surveys", { state });
       return text(res.ok ? res.data : errorPayload("Failed to list surveys", res));
     },
   );
@@ -589,15 +589,19 @@ export function registerCustomObjectTools(server: McpServer) {
         .optional()
         .describe("Records per page (default 20, max 100)."),
       next_token: z.string().optional().describe("Cursor from _links.next."),
+      sort_by: z.string().optional().describe("Field name to sort by."),
+      sort_order: z.enum(["ASC", "DESC"]).optional().describe("Sort direction."),
       filters: z
         .record(z.union([z.string(), z.number(), z.boolean()]))
         .optional()
         .describe("Field filters."),
     },
-    async ({ schema_id, page_size, next_token, filters }) => {
+    async ({ schema_id, page_size, next_token, sort_by, sort_order, filters }) => {
       const res = await fd.get(`/custom_objects/schemas/${schema_id}/records`, {
         page_size,
         next_token,
+        sort_by,
+        sort_order,
         ...filters,
       });
       return text(res.ok ? res.data : errorPayload("Failed to list records", res));
@@ -702,7 +706,8 @@ export function registerFsmTools(server: McpServer) {
   tool(
     server,
     "create_service_task",
-    `Create an FSM service task, optionally under a parent ticket (max 10 per parent). type is forced to 'Service Task'. Fields: ${FSM_FIELDS}.`,
+    `Create an FSM service task, optionally under a parent ticket (max 10 per parent). type is forced to 'Service Task'. ` +
+      `Fields: ${FSM_FIELDS}; any other create_ticket field (source, tags, product_id, cc_emails, due_by…) is also accepted.`,
     {
       parent_id: z.number().int().optional().describe("Parent ticket ID to attach the task to."),
       task: z.record(z.any()).describe("Ticket payload for the task."),
@@ -745,8 +750,8 @@ export function registerOutboundTools(server: McpServer) {
     server,
     "create_outbound_email",
     "Start a new email conversation with a customer (creates an outbound ticket, Closed + assigned to you by default so SLA doesn't run). " +
-      "Required: email, subject, email_config_id (see list_email_configs). Optional: name, description (HTML), status, priority, type, group_id, " +
-      "responder_id, cc_emails[], tags[], custom_fields{}, due_by, fr_due_by. Subject/description can't be edited later.",
+      "Required: email, subject, email_config_id (see list_email_configs). Optional: name, description (HTML), status (default 5=closed), priority (default 1), type, " +
+      "group_id, tags[], custom_fields{}, due_by, fr_due_by. Subject/description can't be edited later.",
     { email: z.record(z.any()).describe("Outbound email payload.") },
     async ({ email }) => {
       const v = validate(OutboundEmailCreate, email);
@@ -841,8 +846,8 @@ export function registerOmnichannelTools(server: McpServer) {
     server,
     "publish_contact_activity",
     "Publish an external-app event (e.g. 'Placed order #123') to a contact's timeline. " +
-      "Payload activity: name (required, shown in timeline), actor{type, email|id…} (required, who did it), source{name, id} (required, which app), " +
-      "timestamp?, description?, link?, object?{…}, context?{…}.",
+      "Payload activity: name (required, shown in timeline), actor{type: 'contact'|…, one of email|id|twitter_id|facebook_id|unique_external_id, is_actor?} " +
+      "(required, who did it), source{name, id} (required, which app), timestamp?, description?, link?, object?{…}, context?{…}.",
     { activity: z.record(z.any()).describe("Activity object.") },
     async ({ activity }) => {
       const res = await fd.post("/contact-activities", { activity });
