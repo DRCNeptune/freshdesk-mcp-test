@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     branches: [main]
+  # Manual publish (re-publish a failed release, or a beta/next tag).
+  # npm trusted publishing allows a single workflow file per package, so manual publishing lives here too.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: npm dist-tag (e.g. latest, beta, next)
+        required: true
+        default: latest
 
 permissions:
   contents: write
@@ -15,6 +23,7 @@ concurrency:
 jobs:
   release-please:
     name: Create release PR
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
@@ -29,11 +38,12 @@ jobs:
   publish:
     name: Publish to npm
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    # always() lets the job run on workflow_dispatch, where release-please is skipped.
+    if: always() && (needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +53,10 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
 
+      # Trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10).
+      - name: Upgrade npm
+        run: npm install -g npm@^11.5.1
+
       - run: npm ci
 
       - name: Build
@@ -51,16 +65,14 @@ jobs:
       - name: Verify dist
         run: test -f dist/index.js && echo "✓ dist/index.js present"
 
+      # No NODE_AUTH_TOKEN: npm authenticates via OIDC as the trusted publisher configured on npmjs.com.
       - name: Publish
-        run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance --tag "${{ inputs.tag || 'latest' }}"
 
       - name: Confirm publication
-        env:
-          VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           PACKAGE=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
           for i in 1 2 3 4 5; do
             if npm view "$PACKAGE@$VERSION" version 2>/dev/null; then
               echo "✓ $PACKAGE@$VERSION published successfully"
