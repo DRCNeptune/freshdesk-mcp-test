@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0](https://github.com/hashcott/freshdesk-mcp/compare/freshdesk-mcp-v1.1.1...freshdesk-mcp-v2.0.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* get_ticket_conversation and list_archived_ticket_conversations return an object ({ conversations, total_returned, pages_fetched, truncated, next_page }) instead of a bare array. Removed tools without a documented endpoint: find_company_by_name (use search_companies), list_thread_messages, list_omnichannel_activities (replaced by publish_contact_activity), list_appointments, view_appointment, list_business_calendars.
+
+### Features
+
+* add discussion follow tools, surface rate-limit retry hints ([b4aa550](https://github.com/hashcott/freshdesk-mcp/commit/b4aa550f52f084a061fcf03b5893191d5749a6fd))
+* align tools with current Freshdesk API, add attachments and conversation pagination ([aa3659a](https://github.com/hashcott/freshdesk-mcp/commit/aa3659aa8fbf9fc634e98b70da8292b81ee0a6da))
+* align tools with current Freshdesk API, add attachments and conversation pagination ([41ec48c](https://github.com/hashcott/freshdesk-mcp/commit/41ec48c3efd50d6ff34d71fd0ffef1608352390e)), closes [#6](https://github.com/hashcott/freshdesk-mcp/issues/6) [#7](https://github.com/hashcott/freshdesk-mcp/issues/7)
+
+
+### Bug Fixes
+
+* align request fields with the Freshdesk API parameter tables ([fbfbf78](https://github.com/hashcott/freshdesk-mcp/commit/fbfbf784dadf67025a19cec475d4077d2285996c))
+
+
+### Documentation
+
+* update README and API documentation for enhanced clarity and structure ([f074b9b](https://github.com/hashcott/freshdesk-mcp/commit/f074b9bdf2841e2341730628485d85b0956fd2f8))
+
 ## [1.1.1](https://github.com/hashcott/freshdesk-mcp/compare/freshdesk-mcp-v1.1.0...freshdesk-mcp-v1.1.1) (2026-06-05)
 
 
