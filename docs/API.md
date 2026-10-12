@@ -1,6 +1,6 @@
 # API Reference
 
-> Generated from the running MCP server by `npm run docs:api` (scripts/gen-api-docs.mjs) — **250 tools**. Do not edit by hand.
+> Generated from the running MCP server by `npm run docs:api` (scripts/gen-api-docs.mjs) — **255 tools**. Do not edit by hand.
 > Payload schemas: [SCHEMAS.md](SCHEMAS.md). Upstream reference: https://developers.freshdesk.com/api/
 
 ## Conventions
@@ -441,6 +441,11 @@
 | `create_topic_comment` | Comment on a forum topic. Payload: body_html (required), answer (mark as answer). | `topic_id`, `comment` | [↗](https://developers.freshdesk.com/api/#create_comment) |
 | `update_topic_comment` | Update a forum comment (body_html, answer). | `comment_id`, `comment` | [↗](https://developers.freshdesk.com/api/#update_comment) |
 | `delete_topic_comment` | Delete a forum comment. | `comment_id` | [↗](https://developers.freshdesk.com/api/#delete_comment) |
+| `follow_discussion` | Monitor (follow) a forum or topic so the user is notified of new posts. | `kind`, `id`, `user_id` | [↗](https://developers.freshdesk.com/api/#monitor_forum) |
+| `unfollow_discussion` | Stop monitoring a forum or topic. | `kind`, `id`, `user_id` | [↗](https://developers.freshdesk.com/api/#unmonitor_forum) |
+| `check_discussion_follow` | Check whether a user monitors a forum or topic. Returns { following: true\|false }. | `kind`, `id`, `user_id` | [↗](https://developers.freshdesk.com/api/#view_monitor_status_for_forum) |
+| `list_followed_topics` | List forum topics monitored by a user. | `user_id`, `page`, `per_page` | [↗](https://developers.freshdesk.com/api/#list_all_monitored_topics) |
+| `list_participated_topics` | List forum topics a user has posted in. | `user_id`, `page`, `per_page` | [↗](https://developers.freshdesk.com/api/#list_all_participated_topics) |
 
 ## Surveys & Satisfaction
 

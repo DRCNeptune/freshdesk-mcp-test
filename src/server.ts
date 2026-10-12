@@ -21,6 +21,7 @@ import { registerContactTools } from "./tools/contacts.js";
 import {
   registerAutomationTools,
   registerCustomObjectTools,
+  registerDiscussionFollowTools,
   registerDiscussionTools,
   registerFsmTools,
   registerJobTools,
@@ -60,6 +61,7 @@ export function buildServer(): McpServer {
   registerTimeEntryTools(server);
 
   registerDiscussionTools(server);
+  registerDiscussionFollowTools(server);
   registerSurveyTools(server);
   registerAutomationTools(server);
   registerScenarioTools(server);

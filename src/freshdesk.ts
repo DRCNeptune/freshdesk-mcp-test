@@ -3,6 +3,11 @@ const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
 
 if (!FRESHDESK_API_KEY || !FRESHDESK_DOMAIN) {
   console.error("[freshdesk-mcp] FRESHDESK_API_KEY and FRESHDESK_DOMAIN env vars are required");
+} else if (!/\.freshdesk\.com$/i.test(FRESHDESK_DOMAIN)) {
+  // The v2 API only answers on <account>.freshdesk.com, not on custom CNAMEs.
+  console.error(
+    `[freshdesk-mcp] FRESHDESK_DOMAIN should be your <account>.freshdesk.com host (got '${FRESHDESK_DOMAIN}'); custom domains are not supported by the API`,
+  );
 }
 
 const authHeader = `Basic ${Buffer.from(`${FRESHDESK_API_KEY}:X`).toString("base64")}`;
@@ -96,5 +101,11 @@ export function errorPayload(prefix: string, res: FreshdeskResult) {
   return {
     error: `${prefix}: HTTP ${res.status}`,
     details: res.data,
+    ...(res.status === 429
+      ? {
+          hint: "Rate limited by Freshdesk; wait retry_after_seconds before retrying.",
+          retry_after_seconds: Number(res.headers.get("retry-after")) || undefined,
+        }
+      : {}),
   };
 }

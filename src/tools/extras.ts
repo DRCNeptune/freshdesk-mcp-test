@@ -237,6 +237,74 @@ export function registerDiscussionTools(server: McpServer) {
   );
 }
 
+// ─── Discussions: monitoring (follow) ────────────
+export function registerDiscussionFollowTools(server: McpServer) {
+  const kind = z.enum(["forum", "topic"]).describe("What to follow.");
+  const id = z.number().int().describe("Forum or topic ID.");
+  const userId = z
+    .number()
+    .int()
+    .optional()
+    .describe("User ID; omit for the API-key owner (admins can act for others).");
+  const followPath = (k: "forum" | "topic", i: number, u?: number) =>
+    `/discussions/${k}s/${i}/follow${u ? `?user_id=${u}` : ""}`;
+
+  tool(
+    server,
+    "follow_discussion",
+    "Monitor (follow) a forum or topic so the user is notified of new posts.",
+    { kind, id, user_id: userId },
+    async ({ kind, id, user_id }) => {
+      const res = await fd.post(followPath(kind, id), user_id ? { user_id } : {});
+      if (res.status === 204) return text({ success: true });
+      return text(errorPayload(`Failed to follow ${kind}`, res));
+    },
+  );
+  tool(
+    server,
+    "unfollow_discussion",
+    "Stop monitoring a forum or topic.",
+    { kind, id, user_id: userId },
+    async ({ kind, id, user_id }) => {
+      const res = await fd.delete(followPath(kind, id, user_id));
+      if (res.status === 204) return text({ success: true });
+      return text(errorPayload(`Failed to unfollow ${kind}`, res));
+    },
+  );
+  tool(
+    server,
+    "check_discussion_follow",
+    "Check whether a user monitors a forum or topic. Returns { following: true|false }.",
+    { kind, id, user_id: userId },
+    async ({ kind, id, user_id }) => {
+      const res = await fd.get(followPath(kind, id, user_id));
+      if (res.status === 204) return text({ following: true });
+      if (res.status === 404) return text({ following: false });
+      return text(errorPayload(`Failed to check ${kind} follow`, res));
+    },
+  );
+  tool(
+    server,
+    "list_followed_topics",
+    "List forum topics monitored by a user.",
+    { user_id: userId, ...pageArgs },
+    async (args) => {
+      const res = await fd.get("/discussions/topics/followed_by", args);
+      return text(res.ok ? res.data : errorPayload("Failed to list followed topics", res));
+    },
+  );
+  tool(
+    server,
+    "list_participated_topics",
+    "List forum topics a user has posted in.",
+    { user_id: userId, ...pageArgs },
+    async (args) => {
+      const res = await fd.get("/discussions/topics/participated_by", args);
+      return text(res.ok ? res.data : errorPayload("Failed to list participated topics", res));
+    },
+  );
+}
+
 // ─── Surveys / Satisfaction ──────────────────────
 const tokenPaging = {
   per_page: z

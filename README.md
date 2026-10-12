@@ -11,7 +11,7 @@
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg" alt="Node"></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-blue.svg" alt="TypeScript"></a>
   <a href="https://github.com/modelcontextprotocol/typescript-sdk"><img src="https://img.shields.io/badge/MCP%20SDK-1.29-purple.svg" alt="MCP SDK"></a>
-  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-250-orange.svg" alt="Tools"></a>
+  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-255-orange.svg" alt="Tools"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
 </p>
 
@@ -48,7 +48,7 @@
 
 | | |
 |---|---|
-| **250 tools** | Tickets, Conversations, Attachments & inline images, Ticket Forms, Contacts, Agents, Availability, Skills, Roles, Groups, Companies, Discussions, Solutions, CSAT Surveys, FSM, Time Entries, Email Configs & Settings, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Email & WhatsApp, and more |
+| **255 tools** | Tickets, Conversations, Attachments & inline images, Ticket Forms, Contacts, Agents, Availability, Skills, Roles, Groups, Companies, Discussions, Solutions, CSAT Surveys, FSM, Time Entries, Email Configs & Settings, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Email & WhatsApp, and more |
 | **2 prompts** | `create_ticket`, `create_reply` |
 | **Strict Zod validation** | Derived from official Freshdesk docs — invalid input is rejected before hitting the API, with structured `{path, code, message}` errors |
 | **Dual transport** | `stdio` for local clients (Claude Desktop, Cursor) or `Streamable HTTP` for hosted/remote agents |
@@ -332,7 +332,7 @@ Sessions begin with `POST /mcp` containing an `initialize` body; the server retu
 | Agents & Groups | 23 | Agents CRUD + `me` + bulk, availability/load settings, groups, admin groups, group membership |
 | Canned Responses | 11 | Folders + responses CRUD, bulk create |
 | Solutions | 18 | Categories / folders / subfolders / articles, search, translations |
-| Discussions | 19 | Forum categories / forums / topics / comments CRUD |
+| Discussions | 24 | Forum categories / forums / topics / comments CRUD, follow/monitor |
 | Surveys & CSAT | 7 | New CSAT surveys + responses, classic satisfaction ratings |
 | Automations & Scenarios | 8 | Rules CRUD per type, scenario automations |
 | Custom Objects | 8 | Schemas, records CRUD, filter, count |
