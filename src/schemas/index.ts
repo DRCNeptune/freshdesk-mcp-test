@@ -395,8 +395,8 @@ const SkillBase = z
   .object({
     name: z.string().optional(),
     rank: z.number().int().optional(),
-    agent_ids: z.array(z.number().int()).optional(),
-    condition_match_type: z.enum(["all", "any"]).optional(),
+    agents: z.array(z.object({ id: z.number().int() }).passthrough()).optional(),
+    match_type: z.enum(["all", "any"]).optional(),
     conditions: z.array(z.record(z.any())).optional(),
   })
   .passthrough();
@@ -690,7 +690,7 @@ export const AutomationRuleCreate = z
     active: z.boolean().optional(),
     performer: z.record(z.any()).optional(),
     events: z.array(z.record(z.any())).optional(),
-    conditions: z.record(z.any()).optional(),
+    conditions: z.union([z.array(z.record(z.any())), z.record(z.any())]).optional(),
     actions: z.array(z.record(z.any())).optional(),
     operator: z.string().optional(),
     summary: z.string().optional(),
@@ -715,37 +715,21 @@ export const CustomObjectRecordUpdate = z
   .passthrough();
 
 // ────────────────────────────────────────────────────────────────────
-// FSM / Threads / Outbound
+// Threads / Outbound
 // ────────────────────────────────────────────────────────────────────
-
-const ServiceTaskBase = z
-  .object({
-    title: z.string().optional(),
-    description: z.string().optional(),
-    status_id: z.number().int().optional(),
-    service_group_id: z.number().int().optional(),
-    assigned_field_technician_id: z.number().int().optional(),
-    scheduled_start_time: z.string().optional(),
-    scheduled_end_time: z.string().optional(),
-    service_location: z.record(z.any()).optional(),
-    custom_fields: CustomFields.optional(),
-  })
-  .passthrough();
-export const ServiceTaskCreate = ServiceTaskBase.refine((v) => !!v.title, {
-  message: "title is required",
-});
-export const ServiceTaskUpdate = ServiceTaskBase;
 
 const ThreadBase = z
   .object({
     type: z.enum(["forward", "discussion", "private"]).optional(),
     title: z.string().optional(),
-    parent_id: z.number().int().optional(),
-    parent_type: z.string().optional(),
+    parent: z
+      .object({ id: z.union([z.string(), z.number()]), type: z.string() })
+      .passthrough()
+      .optional(),
     participants: z
       .object({
-        agents: z.array(z.number().int()).optional(),
-        teams: z.array(z.number().int()).optional(),
+        emails: z.array(z.string()).optional(),
+        agents: z.array(z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -758,14 +742,16 @@ export const ThreadUpdate = ThreadBase;
 const ThreadMessageBase = z
   .object({
     body: z.string().optional(),
-    thread_id: z.number().int().optional(),
+    thread_id: z.union([z.string(), z.number()]).optional(),
     body_text: z.string().optional(),
-    attachment_ids: z.array(z.number().int()).optional(),
+    participants: z.record(z.any()).optional(),
+    additional_info: z.record(z.any()).optional(),
+    attachment_ids: z.array(z.union([z.string(), z.number()])).optional(),
   })
   .passthrough();
 export const ThreadMessageCreate = ThreadMessageBase.refine((v) => !!v.body || !!v.body_text, {
   message: "body or body_text required",
-});
+}).refine((v) => v.thread_id !== undefined, { message: "thread_id is required" });
 export const ThreadMessageUpdate = ThreadMessageBase;
 
 export const OutboundEmailCreate = z

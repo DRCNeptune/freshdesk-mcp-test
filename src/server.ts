@@ -14,12 +14,12 @@ import {
   registerTimeEntryTools,
 } from "./tools/admin_misc.js";
 import { registerAgentTools, registerGroupTools } from "./tools/agents.js";
+import { registerAttachmentTools } from "./tools/attachments.js";
 import { registerCannedTools } from "./tools/canned.js";
 import { registerCompanyTools } from "./tools/companies.js";
 import { registerContactTools } from "./tools/contacts.js";
 import {
   registerAutomationTools,
-  registerAvailabilityTools,
   registerCustomObjectTools,
   registerDiscussionTools,
   registerFsmTools,
@@ -34,11 +34,12 @@ import { registerTicketTools } from "./tools/tickets.js";
 
 export function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "freshdesk-mcp", version: "1.0.0" },
+    { name: "freshdesk-mcp", version: "1.1.1" },
     { capabilities: { tools: {}, prompts: {} } },
   );
 
   registerTicketTools(server);
+  registerAttachmentTools(server);
   registerContactTools(server);
   registerAgentTools(server);
   registerGroupTools(server);
@@ -66,7 +67,6 @@ export function buildServer(): McpServer {
   registerFsmTools(server);
   registerOutboundTools(server);
   registerJobTools(server);
-  registerAvailabilityTools(server);
   registerOmnichannelTools(server);
 
   registerPrompts(server);

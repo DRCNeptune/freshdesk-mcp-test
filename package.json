@@ -18,7 +18,9 @@
     "dev:http": "tsc && MCP_TRANSPORT=http node dist/index.js",
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
-    "format": "biome format --write src/"
+    "format": "biome format --write src/",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "docs:api": "node scripts/gen-api-docs.mjs"
   },
   "files": [
     "dist",
