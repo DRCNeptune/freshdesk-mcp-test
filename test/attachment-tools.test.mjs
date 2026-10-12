@@ -229,3 +229,39 @@ test("get_ticket_attachments: attachment_ids and unknown ids", async () => {
   assert.deepEqual(o.not_found, [999]);
   assert.match(textOf(r), /===== Attachment 1 of 1: b\.txt/);
 });
+
+/* ---------- sensitive data ---------- */
+
+test("get_ticket_attachment: sensitive data is reported with where it is", async () => {
+  fakeTenant([
+    {
+      name: "invoice.txt",
+      type: "text/plain",
+      bytes: Buffer.from("Bank: Example Bank | IBAN: GB82 WEST 1234 5698 7654 32 | Due 30 days"),
+    },
+  ]);
+  const h = json(
+    await handlers.get_ticket_attachment({
+      ticket_id: 1,
+      attachment_id: 100,
+      archived: false,
+      from_image: 0,
+      ...limits,
+    }),
+  );
+  assert.deepEqual(h.sensitive_data.found, ["IBAN"]);
+  assert.equal(h.sensitive_data.masked, false);
+  assert.match(h.sensitive_data.where[0], /Bank: Example Bank/);
+});
+
+test("get_ticket_attachments: sensitive data warning and a request to check images", async () => {
+  fakeTenant([
+    { name: "keys.txt", type: "text/plain", bytes: Buffer.from("password: Hunter22") },
+    { name: "shot.png", type: "image/png", bytes: makePng(20, 20) },
+  ]);
+  const o = json(
+    await handlers.get_ticket_attachments({ ticket_id: 1, cursor: 0, archived: false, ...limits }),
+  );
+  assert.match(o.sensitive_data_warning, /1 file\(s\): keys\.txt/);
+  assert.match(o.images_check, /check the screenshots and scans yourself/);
+});

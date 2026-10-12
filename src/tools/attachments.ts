@@ -20,6 +20,7 @@ import {
   willAnalyse,
 } from "../extract.js";
 import { errorPayload, fd } from "../freshdesk.js";
+import { REDACT_ENABLED, scanSensitive } from "../redact.js";
 import { text, tool } from "../util.js";
 import { fetchConversations } from "./tickets.js";
 
@@ -246,6 +247,10 @@ const GIF_LIST_HANDLING = "image if static; if animated, treated as video and no
 const isGifName = (name: string, contentType: string) =>
   /\.gif$/i.test(name) || contentType.toLowerCase() === "image/gif";
 
+/** The server cannot read text inside images, but the model can: it is asked to look. */
+const IMAGES_CHECK =
+  "The server does not read text inside images: check the screenshots and scans yourself for passwords, tokens, Authorization headers, personal or bank data, and mention what you find.";
+
 type FileStatus = "read" | "partial" | "not_analysed" | "disabled" | "error";
 
 const LIMIT_PARAMS = {
@@ -360,7 +365,29 @@ async function readAttachment(
 
   const out = await extractAny(dl.bytes, name, att.content_type ?? "", budget);
 
-  const { content } = out;
+  // Sensitive data: always detected and reported, masked with FRESHDESK_REDACT=1.
+  const found = new Set<string>();
+  const where: string[] = [];
+  const content = out.content.map((b) => {
+    if (b.type !== "text") return b;
+    const scan = scanSensitive(b.text);
+    for (const f of scan.found) found.add(f);
+    where.push(...scan.where);
+    return { ...b, text: scan.text };
+  });
+  const hasImages = content.some((b) => b.type === "image");
+  const sensitive = found.size
+    ? {
+        sensitive_data: {
+          found: [...found],
+          where: where.slice(0, 10),
+          masked: REDACT_ENABLED,
+          note: `${REDACT_ENABLED ? "Masked in the text." : "Found in the text, returned as is."}${hasImages ? ` ${IMAGES_CHECK}` : ""}`,
+        },
+      }
+    : hasImages
+      ? { images_note: IMAGES_CHECK }
+      : {};
 
   // With no content, the first note is the reason: keep it once, as reason.
   const reason = out.content.length ? undefined : out.notes[0];
@@ -373,6 +400,7 @@ async function readAttachment(
     truncated: budget.truncated,
     ...(notes.length ? { notes } : {}),
     ...(reason ? { analysed: false, reason } : {}),
+    ...sensitive,
   };
   return { header, content };
 }
@@ -466,7 +494,7 @@ export function registerAttachmentTools(server: McpServer) {
       "returns as many complete files as fit in one response (about 900 KB, the MCP client limit). When more remain, the summary " +
       "has next_cursor: call again with cursor set to it to continue, until the summary says all attachments have been returned. " +
       "A file too large for a response on its own is returned in part, with how to continue it with get_ticket_attachment " +
-      "(from_image). Starts with a JSON summary (counters, files in this call with status and reason), " +
+      "(from_image). Starts with a JSON summary (counters, files in this call with status and reason, sensitive data warning), " +
       "then each file under a '===== Attachment N of M =====' marker. Videos and animated GIFs are listed as not analysed and " +
       "never downloaded.",
     {
@@ -565,12 +593,13 @@ export function registerAttachmentTools(server: McpServer) {
             ? { handling: header.handling }
             : {}),
           ...(header.notes ? { notes: header.notes } : {}),
+          ...(header.sensitive_data ? { sensitive_data: header.sensitive_data } : {}),
         });
         if (content.length) {
           sections.push(
             {
               type: "text",
-              text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${continueWith ? ` (${continueWith})` : ""}\nHandling: ${header.handling}`,
+              text: `===== Attachment ${i + 1} of ${selected.length}: ${header.name} (id ${hit.att.id}, ${header.origin}${hit.conversation_id ? `, conversation ${hit.conversation_id}` : ""}) =====\nStatus: ${status}${continueWith ? ` (${continueWith})` : ""}\nHandling: ${header.handling}${header.sensitive_data ? `\nSensitive data: ${(header.sensitive_data as { found: string[] }).found.join(", ")}` : ""}`,
             },
             ...content,
           );
@@ -583,6 +612,7 @@ export function registerAttachmentTools(server: McpServer) {
       }
 
       const count = (st: FileStatus) => entries.filter((e) => e.status === st).length;
+      const sensitiveFiles = entries.filter((e) => e.sensitive_data).map((e) => e.name);
       const overview = {
         ticket_id,
         attachments: selected.length,
@@ -600,6 +630,12 @@ export function registerAttachmentTools(server: McpServer) {
               continue: `${selected.length - nextCursor} attachment(s) left: call get_ticket_attachments again with cursor: ${nextCursor}.`,
             }
           : { complete: "All attachments have been returned." }),
+        ...(sensitiveFiles.length
+          ? {
+              sensitive_data_warning: `Sensitive data found in the text of ${sensitiveFiles.length} file(s): ${sensitiveFiles.join(", ")}. See sensitive_data.where in each file.`,
+            }
+          : {}),
+        ...(sections.some((b) => b.type === "image") ? { images_check: IMAGES_CHECK } : {}),
         ...(missing.length ? { not_found: missing } : {}),
         files: entries,
       };
