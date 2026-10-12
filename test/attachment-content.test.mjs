@@ -8,6 +8,7 @@ process.env.FRESHDESK_MAX_RESPONSE_BYTES = String(200 * 1024);
 const { isTextual, isMedia, download, registerAttachmentTools } = await import(
   "../dist/tools/attachments.js"
 );
+const { makePng } = await import("./fixtures.mjs");
 
 const DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -98,7 +99,17 @@ function fakeTenant(files) {
   return requested;
 }
 
-const call = (args) => handlers.get_ticket_attachment({ archived: false, ...args });
+const call = (args) =>
+  handlers.get_ticket_attachment({
+    archived: false,
+    from_image: 0,
+    max_text_chars: 60_000,
+    max_pages: 50,
+    max_images: 50,
+    har_raw: false,
+    xml_full: false,
+    ...args,
+  });
 const size = (r) => JSON.stringify(r).length;
 
 test("get_ticket_attachment: a .docx is not returned as text", async () => {
@@ -107,7 +118,7 @@ test("get_ticket_attachment: a .docx is not returned as text", async () => {
   fakeTenant([{ name: "report.docx", type: DOCX, bytes: docx }]);
   const r = await call({ ticket_id: 1, attachment_id: 100 });
   assert.ok(!r.content.some((b) => b.type === "text" && b.text.includes("PK\x03\x04")));
-  assert.ok(r.content.some((b) => b.type === "resource"));
+  assert.ok(!r.content.some((b) => b.type === "resource"), "no base64 blob");
 });
 
 test("get_ticket_attachment: video is not downloaded", async () => {
@@ -119,11 +130,12 @@ test("get_ticket_attachment: video is not downloaded", async () => {
   assert.ok(!requested.some((u) => u.includes("/data/")), "no download request");
 });
 
-test("get_ticket_attachment: binary too large for one response returns metadata", async () => {
-  fakeTenant([{ name: "scan.pdf", type: "application/pdf", bytes: Buffer.alloc(300 * 1024) }]);
+test("get_ticket_attachment: an image too large for one response is reported", async () => {
+  // About 260 KB in base64, over the 200 KB limit set above.
+  fakeTenant([{ name: "photo.png", type: "image/png", bytes: makePng(220, 220, true) }]);
   const r = await call({ ticket_id: 1, attachment_id: 100 });
-  assert.equal(r.content.length, 1);
-  assert.match(r.content[0].text, /Too large to return in one response/);
+  assert.equal(r.content.filter((b) => b.type === "image").length, 0);
+  assert.match(r.content[0].text, /response size limit reached/);
   assert.ok(size(r) < 200 * 1024);
 });
 
@@ -137,11 +149,8 @@ test("get_ticket_attachment: large text is truncated under the limit", async () 
 });
 
 test("get_ticket_inline_images: stays under the response limit", async () => {
-  // Six 60 KB "PNG" images (valid header, 640x480) would be about 480 KB in base64.
-  const png = Buffer.alloc(60 * 1024);
-  png.writeUInt32BE(0x89504e47, 0);
-  png.writeUInt32BE(640, 16);
-  png.writeUInt32BE(480, 20);
+  // Six images of about 66 KB in base64 each: about 400 KB together.
+  const png = makePng(150, 110, true);
   const body = [0, 1, 2, 3, 4, 5]
     .map((i) => `<img src="https://acme.attachments.freshdesk.com/inline/${i}.png?Signature=s">`)
     .join("");
@@ -158,7 +167,7 @@ test("get_ticket_inline_images: stays under the response limit", async () => {
     min_dimension: 100,
     archived: false,
   });
-  const summary = JSON.parse(r.content[0].text);
+  const summary = JSON.parse(r.content[0].text.split("\n\nImage ")[0]);
   assert.ok(summary.returned >= 1 && summary.returned < 6);
   assert.ok(summary.skipped_details.some((s) => /does not fit in this response/.test(s.reason)));
   assert.ok(size(r) < 200 * 1024);
