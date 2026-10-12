@@ -4,6 +4,13 @@ import { test } from "node:test";
 
 process.env.FRESHDESK_API_KEY = "k";
 process.env.FRESHDESK_DOMAIN = "x.freshdesk.com";
+// Fork: with page rendering and image conversion installed, these upstream tests
+// describe the behaviour without them. test/neptune.test.mjs covers the fork.
+const FORK_SKIP = {
+  skip:
+    (await import("../dist/extract.js")).optionalCapabilities !== undefined &&
+    (await (await import("../dist/extract.js")).optionalCapabilities()).renderPdfPages,
+};
 process.env.FRESHDESK_MAX_RESPONSE_BYTES = String(200 * 1024);
 const { isTextual, isMedia, download, registerAttachmentTools } = await import(
   "../dist/tools/attachments.js"
@@ -130,7 +137,7 @@ test("get_ticket_attachment: video is not downloaded", async () => {
   assert.ok(!requested.some((u) => u.includes("/data/")), "no download request");
 });
 
-test("get_ticket_attachment: an image too large for one response is reported", async () => {
+test("get_ticket_attachment: an image too large for one response is reported", FORK_SKIP, async () => {
   // About 260 KB in base64, over the 200 KB limit set above.
   fakeTenant([{ name: "photo.png", type: "image/png", bytes: makePng(220, 220, true) }]);
   const r = await call({ ticket_id: 1, attachment_id: 100 });
@@ -148,7 +155,7 @@ test("get_ticket_attachment: large text is truncated under the limit", async () 
   assert.ok(size(r) < 200 * 1024);
 });
 
-test("get_ticket_inline_images: stays under the response limit", async () => {
+test("get_ticket_inline_images: stays under the response limit", FORK_SKIP, async () => {
   // Six images of about 66 KB in base64 each: about 400 KB together.
   const png = makePng(150, 110, true);
   const body = [0, 1, 2, 3, 4, 5]

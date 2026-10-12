@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   ANIMATED_GIF_HANDLING,
   Budget,
+  CONVERSION_UNAVAILABLE,
   classifyByName,
   DISABLED_HANDLING,
   enforceResponseSize,
@@ -14,8 +15,7 @@ import {
   MAX_RESPONSE_BYTES,
   MIN_IMAGE_DIMENSION,
   mergeTextBlocks,
-  sniffSupportedImage,
-  UNSUPPORTED_IMAGE,
+  toSupportedImage,
   UNTRUSTED_NOTICE,
   willAnalyse,
 } from "../extract.js";
@@ -458,6 +458,7 @@ export function registerAttachmentTools(server: McpServer) {
         });
       }
       const budget = budgetFrom(limits);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
       budget.skipImages = from_image;
       const read = await readAttachment(ticket_id, hit, budget);
       const header: Record<string, unknown> = { ...read.header };
@@ -531,6 +532,7 @@ export function registerAttachmentTools(server: McpServer) {
         : found.items;
 
       const budget = budgetFrom(limits);
+      budget.economy = true; // JPEG and greyscale where it changes nothing visible
       const cache = new Map<number, Buffer>();
       const entries: Record<string, unknown>[] = [];
       const sections: Content[] = [];
@@ -854,13 +856,17 @@ export function registerAttachmentTools(server: McpServer) {
           continue;
         }
         total += bytes.length;
-        // BMP, TIFF and HEIC cannot be viewed by the model and are not converted.
-        const mime = sniffSupportedImage(bytes);
-        if (!mime) {
-          skipped.push({ origin, src: shortSrc, reason: `${contentType}: ${UNSUPPORTED_IMAGE}` });
+        // BMP, TIFF and HEIC are converted, very large images resized (optional dependencies).
+        const supported = await toSupportedImage(bytes);
+        if (!supported) {
+          skipped.push({
+            origin,
+            src: shortSrc,
+            reason: `${contentType}: ${CONVERSION_UNAVAILABLE}`,
+          });
           continue;
         }
-        const fit = await sizeBudget.fitImage(bytes, mime);
+        const fit = await sizeBudget.fitImage(supported.data, supported.mimeType);
         if (!fit) {
           skipped.push({
             origin,

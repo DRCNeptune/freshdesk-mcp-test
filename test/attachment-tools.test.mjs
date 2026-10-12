@@ -5,6 +5,13 @@ import { makeDocx, makeGif, makePdf, makePng, makeZip } from "./fixtures.mjs";
 
 process.env.FRESHDESK_API_KEY = "k";
 process.env.FRESHDESK_DOMAIN = "x.freshdesk.com";
+// Fork: with page rendering and image conversion installed, these upstream tests
+// describe the behaviour without them. test/neptune.test.mjs covers the fork.
+const FORK_SKIP = {
+  skip:
+    (await import("../dist/extract.js")).optionalCapabilities !== undefined &&
+    (await (await import("../dist/extract.js")).optionalCapabilities()).renderPdfPages,
+};
 // A small response limit, so continuation can be tested with small files.
 process.env.FRESHDESK_MAX_RESPONSE_BYTES = String(200 * 1024);
 const { registerAttachmentTools } = await import("../dist/tools/attachments.js");
@@ -133,7 +140,7 @@ test("get_ticket_attachment: video is listed as not analysed and not downloaded"
   assert.ok(!requested.some((u) => u.includes("/data/")));
 });
 
-test("get_ticket_attachment: from_image continues a file larger than one response", async () => {
+test("get_ticket_attachment: from_image continues a file larger than one response", FORK_SKIP, async () => {
   // Three hard-to-compress images of about 70 KB in base64 each; about two fit per response.
   const zip = makeZip({
     "a.png": makePng(150, 110, true),
@@ -169,7 +176,7 @@ test("get_ticket_attachment: from_image continues a file larger than one respons
 
 /* ---------- get_ticket_attachments ---------- */
 
-test("get_ticket_attachments: reads in ticket order and continues with cursor", async () => {
+test("get_ticket_attachments: reads in ticket order and continues with cursor", FORK_SKIP, async () => {
   fakeTenant([
     { name: "one.png", type: "image/png", bytes: makePng(150, 110, true) },
     { name: "two.png", type: "image/png", bytes: makePng(150, 110, true) },

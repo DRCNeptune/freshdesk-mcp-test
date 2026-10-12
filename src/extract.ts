@@ -157,7 +157,7 @@ export function classifyByName(name: string, contentType: string): Kind {
 
 /** Names accepted in FRESHDESK_ATTACHMENT_TYPES and the kinds each one enables. */
 export const ATTACHMENT_TYPES: Record<string, Kind[]> = {
-  image: ["image"],
+  image: ["image", "image-convert"],
   pdf: ["pdf"],
   docx: ["docx"],
   xlsx: ["xlsx"],
@@ -206,7 +206,6 @@ const METADATA_ONLY: ReadonlySet<Kind> = new Set([
   "legacy-office",
   "archive-other",
   "image-unsupported",
-  "image-convert",
 ]);
 
 /** Whether a file of this kind will be read, given its type and the configuration. */
@@ -223,7 +222,7 @@ export const NOT_ANALYSED: ReadonlySet<Kind> = new Set(["video", "audio", "execu
 
 export const HANDLING: Record<Kind, string> = {
   image: "image",
-  "image-convert": "image format the model cannot view (BMP, TIFF, HEIC): metadata only",
+  "image-convert": "image (converted to PNG/JPEG)",
   pdf: "PDF text, pages with images or without text rendered as images",
   docx: "Word document as text",
   xlsx: "spreadsheet as tables",
@@ -371,7 +370,156 @@ export const MAX_RESPONSE_BYTES = (() => {
   return Number.isFinite(v) && v >= 100_000 ? v : 900 * 1024;
 })();
 
+/** One image never takes more than this in the response (base64 characters). */
+const MAX_IMAGE_B64 = 250_000;
+
 const base64Length = (bytes: number) => Math.ceil(bytes / 3) * 4;
+
+/* -------------------------------------------------------------------------- */
+/* Optional libraries                                                         */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * Page rendering (@napi-rs/canvas) and image conversion (jimp, heic-convert) are
+ * optional: they add about 100 MB to an install. Without them, text is still
+ * extracted from every format and supported images are returned as they are; only
+ * rendering scanned or image PDF pages and converting or resizing images are skipped,
+ * and the output says so.
+ */
+
+interface JimpImage {
+  width: number;
+  height: number;
+  bitmap: { data: Uint8Array };
+  clone(): JimpImage;
+  scale(factor: number): JimpImage;
+  scaleToFit(size: { w: number; h: number }): JimpImage;
+  greyscale(): JimpImage;
+  getBuffer(mime: string, options?: { quality?: number }): Promise<Buffer>;
+}
+interface JimpStatic {
+  read(data: Buffer): Promise<JimpImage>;
+}
+interface CanvasContext2D {
+  fillStyle: string;
+  fillRect(x: number, y: number, w: number, h: number): void;
+}
+interface CanvasLike {
+  width: number;
+  height: number;
+  getContext(type: "2d"): CanvasContext2D;
+  toBuffer(mime: "image/jpeg", quality?: number): Buffer;
+}
+interface CanvasModule {
+  createCanvas(width: number, height: number): CanvasLike;
+}
+type HeicConvert = (options: {
+  buffer: Buffer;
+  format: "JPEG" | "PNG";
+  quality?: number;
+}) => Promise<Uint8Array>;
+
+const optionalModules = new Map<string, Promise<unknown>>();
+
+/** Loads an optional dependency once. Null when it is not installed. */
+function optionalModule<T>(name: string): Promise<T | null> {
+  let loading = optionalModules.get(name);
+  if (!loading) {
+    loading = import(name).catch(() => null);
+    optionalModules.set(name, loading);
+  }
+  return loading as Promise<T | null>;
+}
+
+const loadJimp = async () => (await optionalModule<{ Jimp: JimpStatic }>("jimp"))?.Jimp ?? null;
+const loadCanvas = () => optionalModule<CanvasModule & Record<string, unknown>>("@napi-rs/canvas");
+const loadHeicConvert = async () =>
+  (await optionalModule<{ default: HeicConvert }>("heic-convert"))?.default ?? null;
+
+/** Why an image could not be turned into PNG/JPEG/GIF/WebP. */
+async function whyNotDecoded(b: Buffer): Promise<string> {
+  const isHeic = b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp";
+  const available = isHeic ? (await loadHeicConvert()) !== null : (await loadJimp()) !== null;
+  return available ? "image could not be decoded" : CONVERSION_UNAVAILABLE;
+}
+
+/** Which optional capabilities are installed. */
+export async function optionalCapabilities() {
+  return {
+    renderPdfPages: (await loadCanvas()) !== null,
+    convertImages: (await loadJimp()) !== null,
+    convertHeic: (await loadHeicConvert()) !== null,
+  };
+}
+
+export const RENDERING_UNAVAILABLE =
+  "page rendering is not available (optional dependency @napi-rs/canvas is not installed)";
+export const CONVERSION_UNAVAILABLE =
+  "image conversion is not available (optional dependency jimp or heic-convert is not installed)";
+
+/**
+ * Re-encodes an image until its base64 form fits in `limit` characters: first a
+ * lower JPEG quality, then smaller sizes, never below 60% so text in screenshots and
+ * scans stays legible. Null when it cannot fit or be decoded.
+ */
+export async function shrinkToFit(
+  data: Buffer,
+  mimeType: string,
+  limit: number,
+): Promise<{ data: Buffer; mimeType: string } | null> {
+  if (base64Length(data.length) <= limit) return { data, mimeType };
+  if (limit < 15_000) return null;
+  const Jimp = await loadJimp();
+  if (!Jimp) return null;
+  let img: JimpImage;
+  try {
+    img = await Jimp.read(data);
+  } catch {
+    return null;
+  }
+  for (const [scale, quality] of [
+    [1, 75],
+    [1, 60],
+    [0.75, 60],
+    [0.6, 55],
+  ]) {
+    const candidate = img.clone();
+    if (scale < 1) candidate.scale(scale);
+    const out = await candidate.getBuffer("image/jpeg", { quality });
+    if (base64Length(out.length) <= limit) return { data: out, mimeType: "image/jpeg" };
+  }
+  return null;
+}
+
+/**
+ * Cheaper encoding for documents read in bulk: JPEG instead of PNG, and greyscale
+ * when the image is (almost) black and white, as most scans and many screenshots
+ * are. Text stays legible. Returns null when it does not save anything.
+ */
+async function economize(data: Buffer): Promise<{ data: Buffer; mimeType: string } | null> {
+  const Jimp = await loadJimp();
+  if (!Jimp) return null;
+  let img: JimpImage;
+  try {
+    img = await Jimp.read(data);
+  } catch {
+    return null;
+  }
+  const px = img.bitmap.data;
+  const step = Math.max(4, Math.floor(px.length / 4 / 20_000) * 4);
+  let colored = 0;
+  let samples = 0;
+  for (let i = 0; i < px.length; i += step) {
+    samples++;
+    const r = px[i];
+    const g = px[i + 1];
+    const b = px[i + 2];
+    if (Math.max(r, g, b) - Math.min(r, g, b) > 28) colored++;
+  }
+  if (colored / Math.max(1, samples) < 0.02) img.greyscale();
+  const out = await img.getBuffer("image/jpeg", { quality: 72 });
+  return out.length < data.length ? { data: out, mimeType: "image/jpeg" } : null;
+}
 
 /**
  * Shared limits for one tool call: characters of text, number of images and bytes
@@ -385,6 +533,8 @@ export class Budget {
   truncated = false;
   /** Set when an image was dropped because the response size limit was reached. */
   sizeLimited = false;
+  /** Cheaper image encoding, used when several files share one response. */
+  economy = false;
   /** False when the "image" type is disabled: no image (page render, embedded image) is returned. */
   readonly imagesEnabled = kindEnabled("image");
   constructor(readonly opts: ExtractOptions) {
@@ -445,15 +595,22 @@ export class Budget {
     this.images--;
     return true;
   }
-  /**
-   * Accounts for an image if it fits in what is left of the response. Null when it does
-   * not: the image is reported instead, and later images wait for the next call.
-   */
+  /** Shrinks an image to fit the remaining response size and accounts for it. Null when it does not fit. */
   async fitImage(
     data: Buffer,
     mimeType: string,
   ): Promise<{ data: Buffer; mimeType: string } | null> {
-    const fitted = base64Length(data.length) <= this.imageBytes ? { data, mimeType } : null;
+    const cap = Math.min(MAX_IMAGE_B64, this.imageBytes);
+    if (this.economy) {
+      if (base64Length(data.length) > 40_000) {
+        const cheaper = await economize(data);
+        if (cheaper) {
+          data = cheaper.data;
+          mimeType = cheaper.mimeType;
+        }
+      }
+    }
+    const fitted = await shrinkToFit(data, mimeType, cap);
     if (!fitted) {
       // The slot reserved by takeImage is given back: only the size was the problem.
       this.images++;
@@ -472,6 +629,8 @@ export class Budget {
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
+const MAX_IMAGE_EDGE = 1568;
+const MAX_IMAGE_BYTES = 3_500_000;
 const MAX_TABLE_ROWS = 200;
 const MAX_ZIP_ENTRIES_LISTED = 200;
 const MAX_ZIP_FILES_EXTRACTED = 25;
@@ -537,9 +696,59 @@ async function withTimeout<T>(p: Promise<T>, what: string): Promise<T> {
 /* Images                                                                     */
 /* -------------------------------------------------------------------------- */
 
-/** Image formats the model cannot view (BMP, TIFF, HEIC) are reported, not converted. */
-export const UNSUPPORTED_IMAGE =
-  "image format the model cannot view (BMP, TIFF, HEIC), not converted: metadata only";
+/**
+ * Returns an image block in a supported format, converting BMP/TIFF/HEIC and
+ * shrinking very large images. Returns null when the image cannot be decoded.
+ */
+export async function toSupportedImage(
+  b: Buffer,
+): Promise<{ data: Buffer; mimeType: string; note?: string } | null> {
+  let data = b;
+  let mime = sniffSupportedImage(b);
+  let note: string | undefined;
+
+  if (!mime) {
+    const isHeic = b.length >= 12 && b.toString("ascii", 4, 8) === "ftyp";
+    try {
+      if (isHeic) {
+        const heicConvert = await loadHeicConvert();
+        if (!heicConvert) return null;
+        data = Buffer.from(await heicConvert({ buffer: b, format: "JPEG", quality: 0.85 }));
+        mime = "image/jpeg";
+        note = "converted from HEIC";
+      } else {
+        const Jimp = await loadJimp();
+        if (!Jimp) return null;
+        const img = await Jimp.read(b);
+        data = await img.getBuffer("image/png");
+        mime = "image/png";
+        note = "converted to PNG";
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // Shrink large images (only formats Jimp can re-encode safely).
+  if (mime !== "image/webp" && mime !== "image/gif") {
+    try {
+      const Jimp = await loadJimp();
+      if (!Jimp) return { data, mimeType: mime, note };
+      const img = await Jimp.read(data);
+      const tooBig =
+        img.width > MAX_IMAGE_EDGE || img.height > MAX_IMAGE_EDGE || data.length > MAX_IMAGE_BYTES;
+      if (tooBig) {
+        img.scaleToFit({ w: MAX_IMAGE_EDGE, h: MAX_IMAGE_EDGE });
+        data = await img.getBuffer("image/jpeg", { quality: 85 });
+        mime = "image/jpeg";
+        note = `${note ? `${note}, ` : ""}resized to ${img.width}x${img.height}`;
+      }
+    } catch {
+      // Keep the original if it cannot be re-encoded.
+    }
+  }
+  return { data, mimeType: mime, note };
+}
 
 /* -------------------------------------------------------------------------- */
 /* Extractors                                                                 */
@@ -560,45 +769,78 @@ const extractImage: Extractor = async (b, name, budget) => {
     return { kind: "image", content: [], notes: ["image returned in a previous part"] };
   if (!budget.takeImage())
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
-  const mime = sniffSupportedImage(b);
-  if (!mime) return { kind: "image-convert", content: [], notes: [UNSUPPORTED_IMAGE] };
-  const fit = await budget.fitImage(b, mime);
+  const img = await toSupportedImage(b);
+  if (!img) return { kind: "image-convert", content: [], notes: [await whyNotDecoded(b)] };
+  const fit = await budget.fitImage(img.data, img.mimeType);
   if (!fit)
     return { kind: "image", content: [], notes: [`image skipped: ${budget.imageLimitReason()}`] };
   return {
     kind: "image",
     content: [
-      textBlock(`Image: ${name}`),
+      textBlock(`Image: ${name}${img.note ? ` (${img.note})` : ""}`),
       { type: "image", data: fit.data.toString("base64"), mimeType: fit.mimeType },
     ],
-    notes: [],
-    handling: "image",
+    notes: img.note ? [img.note] : [],
+    handling: img.note ? `image (${img.note})` : "image",
   };
 };
 
 let pdfjsPromise: Promise<typeof import("pdfjs-dist/legacy/build/pdf.mjs")> | undefined;
-/**
- * Loaded on first use: most calls never read a PDF. pdf.js prints warnings with
- * console.log, which is stdout, and on the stdio transport stdout carries the MCP
- * protocol: anything else written there breaks the session. Its load-time warnings
- * ("Cannot polyfill DOMMatrix", harmless for text extraction) go to stderr instead, and
- * documents are opened with verbosity 0.
- */
-function loadPdfjs() {
-  pdfjsPromise ??= (async () => {
-    const log = console.log;
-    console.log = (...args: unknown[]) => console.error(...args);
-    try {
-      const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-      return pdfjs;
-    } finally {
-      console.log = log;
-    }
-  })();
+async function loadPdfjs() {
+  if (!pdfjsPromise) {
+    pdfjsPromise = (async () => {
+      const napi = await loadCanvas();
+      const g = globalThis as Record<string, unknown>;
+      // pdf.js needs these browser globals to render in Node (text extraction does not).
+      if (napi)
+        for (const k of ["DOMMatrix", "Path2D", "ImageData"] as const) {
+          if (!g[k]) g[k] = napi[k];
+        }
+      // pdf.js prints warnings with console.log (stdout), which carries the stdio protocol.
+      const log = console.log;
+      console.log = (...args: unknown[]) => console.error(...args);
+      try {
+        return await import("pdfjs-dist/legacy/build/pdf.mjs");
+      } finally {
+        console.log = log;
+      }
+    })();
+  }
   return pdfjsPromise;
 }
 
-/** Pages with fewer characters than this are treated as scanned (no text layer). */
+let standardFonts: string | undefined;
+async function standardFontsPath(): Promise<string> {
+  if (!standardFonts) {
+    const { createRequire } = await import("node:module");
+    const { dirname, join, sep } = await import("node:path");
+    const require = createRequire(import.meta.url);
+    standardFonts =
+      join(dirname(require.resolve("pdfjs-dist/package.json")), "standard_fonts") + sep;
+  }
+  return standardFonts;
+}
+
+class NapiCanvasFactory {
+  private napi: CanvasModule;
+  constructor(napi: CanvasModule) {
+    this.napi = napi;
+  }
+  create(width: number, height: number) {
+    const canvas = this.napi.createCanvas(Math.max(1, width), Math.max(1, height));
+    return { canvas, context: canvas.getContext("2d") };
+  }
+  reset(cc: { canvas: { width: number; height: number } }, width: number, height: number) {
+    cc.canvas.width = width;
+    cc.canvas.height = height;
+  }
+  destroy(cc: { canvas: { width: number; height: number } }) {
+    cc.canvas.width = 0;
+    cc.canvas.height = 0;
+  }
+}
+
+/** Pages with fewer characters than this are treated as scanned and rendered. */
 const SCANNED_PAGE_CHARS = 25;
 
 /**
@@ -709,12 +951,17 @@ async function countSignificantImages(
 
 const extractPdf: Extractor = async (b, _name, budget) => {
   const pdfjs = await loadPdfjs();
+  const napi = await loadCanvas();
   const notes: string[] = [];
   let doc: Awaited<ReturnType<typeof pdfjs.getDocument>["promise"]>;
   try {
     doc = await pdfjs.getDocument({
       data: new Uint8Array(b),
+      // biome-ignore lint/suspicious/noExplicitAny: pdf.js 4.4 accepts a factory instance here.
+      ...(napi ? { canvasFactory: new NapiCanvasFactory(napi) as any } : {}),
       isEvalSupported: false,
+      // Lets pdf.js draw the 14 standard PDF fonts when a document does not embed them.
+      standardFontDataUrl: await standardFontsPath(),
       disableFontFace: true,
       useSystemFonts: false,
       verbosity: 0,
@@ -727,50 +974,122 @@ const extractPdf: Extractor = async (b, _name, budget) => {
     return { kind: "pdf", content: [], notes: [msg] };
   }
 
+  // biome-ignore lint/suspicious/noExplicitAny: pdf.js page proxy.
+  const renderPage = async (page: any): Promise<Buffer> => {
+    if (!napi) throw new Error(RENDERING_UNAVAILABLE);
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(2.5, MAX_IMAGE_EDGE / Math.max(base.width, base.height));
+    const vp = page.getViewport({ scale });
+    const canvas = napi.createCanvas(Math.ceil(vp.width), Math.ceil(vp.height));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "white";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // biome-ignore lint/suspicious/noExplicitAny: napi-rs context is API compatible with CanvasRenderingContext2D.
+    await page.render({ canvasContext: ctx as any, viewport: vp }).promise;
+    return canvas.toBuffer("image/jpeg", 85);
+  };
+
+  const content: Content[] = [];
   const parts: string[] = [];
+  let rendered = 0;
   let scannedPages = 0;
   let imagePages = 0;
+  let scannedRendered = 0;
+  let notRenderable = 0;
+  let imagePagesRendered = 0;
   for (let n = 1; n <= doc.numPages; n++) {
-    if (budget.chars <= 0) {
-      notes.push(`stopped at page ${n - 1} of ${doc.numPages}: max_text_chars reached`);
+    if (budget.chars <= 0 && budget.images <= 0) {
+      notes.push(`stopped at page ${n - 1} of ${doc.numPages}: limits reached`);
       budget.truncated = true;
       break;
     }
     const page = await doc.getPage(n);
     const tc = await page.getTextContent();
     const pageText = joinPdfTextItems(tc.items as PdfTextItem[]);
-    if (pageText.length < SCANNED_PAGE_CHARS) {
-      // Scanned page: its content is an image, and pages are not rendered.
-      scannedPages++;
-      parts.push(
-        `--- Page ${n} --- (no text layer, probably scanned: content not available as text)`,
-      );
-    } else {
-      const images = (await countSignificantImages(page, pdfjs.OPS)).count;
-      if (images > 0) imagePages++;
-      parts.push(
-        `--- Page ${n} ---${images ? ` (also contains ${images} image(s), not rendered)` : ""}\n${pageText}`,
-      );
+    const scanned = pageText.length < SCANNED_PAGE_CHARS;
+    const found = scanned
+      ? { count: 0, largestShortSide: 0 }
+      : await countSignificantImages(page, pdfjs.OPS);
+    const images = found.count;
+
+    if (!scanned && images === 0) {
+      parts.push(`--- Page ${n} ---\n${pageText}`);
+      page.cleanup();
+      continue;
     }
+
+    if (scanned) scannedPages++;
+    else imagePages++;
+    const why = scanned ? "scanned page" : `page with ${images} image(s)`;
+    if (budget.skipImage()) {
+      parts.push(
+        `--- Page ${n} --- (${why}, rendered as an image in a previous part)${scanned ? "" : `\n${pageText}`}`,
+      );
+      page.cleanup();
+      continue;
+    }
+    if (!napi) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: ${RENDERING_UNAVAILABLE})${scanned ? "" : `\n${pageText}`}`,
+      );
+      notRenderable++;
+      page.cleanup();
+      continue;
+    }
+    if (rendered >= budget.opts.maxPages) budget.imagesStopped = true;
+    if (rendered >= budget.opts.maxPages || !budget.takeImage()) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
+      );
+      budget.truncated = true;
+      page.cleanup();
+      continue;
+    }
+    const fit = await budget.fitImage(await renderPage(page), "image/jpeg");
+    if (!fit) {
+      parts.push(
+        `--- Page ${n} --- (${why}, not rendered: ${budget.imageLimitReason()})${scanned ? "" : `\n${pageText}`}`,
+      );
+      page.cleanup();
+      continue;
+    }
+    const jpg = fit.data;
+    rendered++;
+    if (scanned) scannedRendered++;
+    else imagePagesRendered++;
+    // Text pages keep their text: the rendered image is only there for the pictures.
+    parts.push(
+      `--- Page ${n} --- (${why}, rendered as image ${rendered})${scanned ? "" : `\n${pageText}`}`,
+    );
+    content.push(textBlock(`Rendered page ${n}`), {
+      type: "image",
+      data: jpg.toString("base64"),
+      mimeType: "image/jpeg",
+    });
     page.cleanup();
   }
   await doc.destroy();
+  if (notRenderable > 0)
+    notes.push(`${notRenderable} page(s) not rendered: ${RENDERING_UNAVAILABLE}`);
   if (scannedPages > 0)
     notes.push(
-      `${scannedPages} page(s) have no text layer (probably scanned): their content is not available as text`,
+      `${scannedPages} page(s) had no text layer (scanned), ${scannedRendered} rendered as images`,
     );
   if (imagePages > 0)
-    notes.push(`${imagePages} page(s) also contain images, which are not rendered`);
+    notes.push(
+      `${imagePages} page(s) with text also contain images, ${imagePagesRendered} rendered as images`,
+    );
   return {
     kind: "pdf",
     content: [
       textBlock(budget.takeText(`PDF with ${doc.numPages} page(s)\n\n${parts.join("\n\n")}`)),
+      ...content,
     ],
     notes,
     handling:
       scannedPages > 0 && scannedPages === doc.numPages
-        ? `scanned PDF (${doc.numPages} page(s), no text layer): no text available`
-        : `PDF text (${doc.numPages - scannedPages} of ${doc.numPages} page(s) with text${scannedPages ? `, ${scannedPages} scanned` : ""})`,
+        ? `scanned PDF (${doc.numPages} page(s), no text layer), ${rendered} of ${doc.numPages} page(s) rendered as images`
+        : `PDF text (${doc.numPages - scannedPages} of ${doc.numPages} page(s) with text${scannedPages ? `, ${scannedPages} scanned` : ""}), ${rendered ? `${rendered} page(s) rendered as images` : "no page rendered"}`,
   };
 };
 
@@ -798,12 +1117,12 @@ const extractDocx: Extractor = async (b, _name, budget) => {
       );
       break;
     }
-    const mime = sniffSupportedImage(embedded[i]);
-    if (!mime) {
-      notes.push(`embedded image ${i + 1}: ${UNSUPPORTED_IMAGE}`);
+    const img = await toSupportedImage(embedded[i]);
+    if (!img) {
+      notes.push(`embedded image ${i + 1}: ${await whyNotDecoded(embedded[i])}`);
       continue;
     }
-    const fit = await budget.fitImage(embedded[i], mime);
+    const fit = await budget.fitImage(img.data, img.mimeType);
     if (!fit) {
       notes.push(
         `embedded images ${i + 1} to ${embedded.length} skipped: ${budget.imageLimitReason()}`,
@@ -1456,6 +1775,7 @@ export function mergeTextBlocks(content: Content[]): Content[] {
 
 const EXTRACTORS: Partial<Record<Kind, Extractor>> = {
   image: extractImage,
+  "image-convert": extractImage,
   pdf: extractPdf,
   docx: extractDocx,
   xlsx: extractXlsx,

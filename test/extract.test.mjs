@@ -5,6 +5,13 @@ import { makeDocx, makeGif, makePdf, makePng, makePptx, makeXlsx, makeZip } from
 
 process.env.FRESHDESK_API_KEY = "k";
 process.env.FRESHDESK_DOMAIN = "x.freshdesk.com";
+// Fork: with page rendering and image conversion installed, these upstream tests
+// describe the behaviour without them. test/neptune.test.mjs covers the fork.
+const FORK_SKIP = {
+  skip:
+    (await import("../dist/extract.js")).optionalCapabilities !== undefined &&
+    (await (await import("../dist/extract.js")).optionalCapabilities()).renderPdfPages,
+};
 const {
   Budget,
   extractAny,
@@ -28,7 +35,7 @@ const textOf = (r) =>
 
 /* ---------- PDF ---------- */
 
-test("PDF: text page by page, scanned pages reported", async () => {
+test("PDF: text page by page, scanned pages reported", FORK_SKIP, async () => {
   const r = await extract(
     makePdf([["Launchpad error on tile ODATA-500", "Second line"], []]),
     "report.pdf",
@@ -183,7 +190,7 @@ test("XML: one-line XML is indented without changing its content", () => {
 
 /* ---------- Images and media ---------- */
 
-test("images: PNG returned, BMP reported, animated GIF treated as video", async () => {
+test("images: PNG returned, BMP reported, animated GIF treated as video", FORK_SKIP, async () => {
   const png = await extract(makePng(20, 10), "shot.png");
   assert.equal(png.content.filter((c) => c.type === "image").length, 1);
 
