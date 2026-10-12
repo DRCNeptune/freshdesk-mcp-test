@@ -122,9 +122,7 @@ const TicketBase = z
     status: TicketStatusEnum.optional(),
     priority: TicketPriorityEnum.optional(),
     description: z.string().optional(),
-    description_text: z.string().optional(),
     source: TicketSourceEnum.optional(),
-    source_info: z.record(z.any()).optional(),
 
     // Assignment
     responder_id: z.number().int().optional(),
@@ -139,9 +137,6 @@ const TicketBase = z
 
     // Emails
     cc_emails: z.array(z.string().email()).optional(),
-    reply_cc_emails: z.array(z.string().email()).optional(),
-    fwd_emails: z.array(z.string().email()).optional(),
-    to_emails: z.array(z.string().email()).optional(),
 
     // Other
     custom_fields: CustomFields.optional(),
@@ -150,9 +145,8 @@ const TicketBase = z
     fr_due_by: z.string().optional(), // ISO-8601
 
     // Linking
-    parent_id: z.number().int().optional(),
-    association_type: TicketAssociationTypeEnum.optional(),
-    associated_tickets_list: z.array(z.number().int()).optional(),
+    parent_id: z.number().int().optional(), // create as child of this ticket
+    related_ticket_ids: z.array(z.number().int()).optional(), // create as tracker of these tickets
 
     lookup_parameter: z.string().optional(),
   })
@@ -170,8 +164,8 @@ export const TicketCreate = TicketBase.refine(
     message:
       "Provide one of: email, requester_id, facebook_id, phone, twitter_id, unique_external_id",
   },
-).refine((v) => !!v.subject || !!v.description || !!v.description_text, {
-  message: "Provide at least one of: subject, description, description_text",
+).refine((v) => !!v.subject || !!v.description, {
+  message: "Provide at least one of: subject, description",
 });
 
 export const TicketUpdate = TicketBase; // All fields already optional
@@ -226,6 +220,15 @@ export const ReplyCreate = z
   })
   .passthrough();
 
+export const ReplyToForwardCreate = z
+  .object({
+    body: z.string(),
+    body_text: z.string().optional(),
+    to_emails: z.array(z.string().email()).min(1),
+    user_id: z.number().int().optional(),
+  })
+  .passthrough();
+
 export const NoteCreate = z
   .object({
     body: z.string(),
@@ -250,6 +253,8 @@ const ContactBase = z
   .object({
     name: z.string().optional(),
     email: z.string().email().optional(),
+    other_emails: z.array(z.string().email()).optional(),
+    social_handler: z.array(z.record(z.any())).max(10).optional(),
     phone: z.string().optional(),
     mobile: z.string().optional(),
     twitter_id: z.string().optional(),
@@ -280,9 +285,18 @@ const ContactBase = z
 
 export const ContactCreate = ContactBase.refine((v) => !!v.name, {
   message: "name is required",
-}).refine((v) => !!v.email || !!v.phone || !!v.mobile || !!v.twitter_id || !!v.unique_external_id, {
-  message: "Provide one of: email, phone, mobile, twitter_id, unique_external_id",
-});
+}).refine(
+  (v) =>
+    !!v.email ||
+    !!v.phone ||
+    !!v.mobile ||
+    !!v.twitter_id ||
+    !!v.unique_external_id ||
+    (Array.isArray(v.social_handler) && v.social_handler.length > 0),
+  {
+    message: "Provide one of: email, phone, mobile, twitter_id, unique_external_id, social_handler",
+  },
+);
 
 export const ContactUpdate = ContactBase;
 
@@ -301,9 +315,11 @@ export const MakeAgentFields = z
     ticket_scope: AgentTicketScopeEnum.optional(),
     skill_ids: z.array(z.number().int()).optional(),
     group_ids: z.array(z.number().int()).optional(),
+    contribution_group_ids: z.array(z.number().int()).optional(),
     role_ids: z.array(z.number().int()).optional(),
     agent_type: z.number().int().optional(),
     type: z.string().optional(),
+    focus_mode: z.boolean().optional(),
   })
   .passthrough();
 
@@ -341,6 +357,7 @@ const AgentBase = z
     signature: z.string().optional(),
     skill_ids: z.array(z.number().int()).optional(),
     group_ids: z.array(z.number().int()).optional(),
+    contribution_group_ids: z.array(z.number().int()).optional(),
     role_ids: z.array(z.number().int()).optional(),
     agent_type: z.number().int().optional(),
     type: z.string().optional(),
@@ -380,7 +397,11 @@ const GroupBase = z
     escalate_to: z.number().int().optional(),
     unassigned_for: UnassignedForEnum.optional(),
     business_hour_id: z.number().int().optional(),
+    // admin groups API (/admin/groups)
+    type: z.string().optional(),
+    business_calendar_id: z.number().int().optional(),
     allow_agents_to_change_availability: z.boolean().optional(),
+    automatic_agent_assignment: z.record(z.any()).optional(),
   })
   .passthrough();
 
@@ -395,8 +416,8 @@ const SkillBase = z
   .object({
     name: z.string().optional(),
     rank: z.number().int().optional(),
-    agent_ids: z.array(z.number().int()).optional(),
-    condition_match_type: z.enum(["all", "any"]).optional(),
+    agents: z.array(z.object({ id: z.number().int() }).passthrough()).optional(),
+    match_type: z.enum(["all", "any"]).optional(),
     conditions: z.array(z.record(z.any())).optional(),
   })
   .passthrough();
@@ -539,36 +560,39 @@ const ForumBase = z
     description: z.string().optional(),
     forum_type: ForumTypeEnum.optional(),
     forum_visibility: ForumVisibilityEnum.optional(),
-    customer_ids: z.array(z.number().int()).optional(),
+    company_ids: z.array(z.number().int()).optional(),
+    forum_category_id: z.number().int().optional(),
   })
   .passthrough();
-export const ForumCreate = ForumBase.refine((v) => !!v.name && v.forum_type !== undefined, {
-  message: "name and forum_type are required",
-});
+export const ForumCreate = ForumBase.refine(
+  (v) => !!v.name && v.forum_type !== undefined && v.forum_visibility !== undefined,
+  { message: "name, forum_type and forum_visibility are required" },
+);
 export const ForumUpdate = ForumBase;
 
 const TopicBase = z
   .object({
     title: z.string().optional(),
-    message_html: z.string().optional(),
+    message: z.string().optional(),
+    forum_id: z.number().int().optional(), // update only: move topic
     sticky: z.boolean().optional(),
     locked: z.boolean().optional(),
     stamp_type: z.number().int().optional(),
   })
   .passthrough();
-export const TopicCreate = TopicBase.refine((v) => !!v.title && !!v.message_html, {
-  message: "title and message_html are required",
+export const TopicCreate = TopicBase.refine((v) => !!v.title && !!v.message, {
+  message: "title and message are required",
 });
 export const TopicUpdate = TopicBase;
 
 const CommentBase = z
   .object({
-    body_html: z.string().optional(),
-    answer: z.boolean().optional(),
+    body: z.string().optional(),
+    answer: z.boolean().optional(), // update only: mark as the answer
   })
   .passthrough();
-export const CommentCreate = CommentBase.refine((v) => !!v.body_html, {
-  message: "body_html is required",
+export const CommentCreate = CommentBase.refine((v) => !!v.body, {
+  message: "body is required",
 });
 export const CommentUpdate = CommentBase;
 
@@ -597,7 +621,8 @@ const TicketFieldBase = z
     displayed_to_customers: z.boolean().optional(),
     customers_can_edit: z.boolean().optional(),
     choices: z.array(FieldChoice).optional(),
-    default: z.boolean().optional(),
+    dependent_fields: z.array(z.record(z.any())).optional(),
+    section_mappings: z.array(z.record(z.any())).optional(),
   })
   .passthrough();
 export const TicketFieldCreate = TicketFieldBase.refine((v) => !!v.label && !!v.type, {
@@ -627,28 +652,50 @@ const ContactFieldBase = z
     customers_can_edit: z.boolean().optional(),
     required_for_customers: z.boolean().optional(),
     displayed_for_customers: z.boolean().optional(),
+    agents_can_edit: z.boolean().optional(),
+    displayed_for_agents: z.boolean().optional(),
+    quick_add_for_agent: z.boolean().optional(),
+    unique: z.boolean().optional(),
     choices: z.array(FieldChoice).optional(),
   })
   .passthrough();
+const AGENT_FIELD_FLAGS = [
+  "agents_can_edit",
+  "displayed_for_agents",
+  "quick_add_for_agent",
+  "unique",
+] as const;
+const hasAgentFlags = (v: Record<string, unknown>) =>
+  AGENT_FIELD_FLAGS.every((k) => typeof v[k] === "boolean");
 export const ContactFieldCreate = ContactFieldBase.refine(
-  (v) => !!v.label && !!v.label_for_customers && !!v.type,
-  { message: "label, label_for_customers, type are required" },
+  (v) => !!v.label && !!v.label_for_customers && !!v.type && hasAgentFlags(v),
+  {
+    message:
+      "label, label_for_customers, type, agents_can_edit, displayed_for_agents, quick_add_for_agent, unique are required",
+  },
 );
 export const ContactFieldUpdate = ContactFieldBase;
 
 const CompanyFieldBase = z
   .object({
     label: z.string().optional(),
-    label_for_customers: z.string().optional(),
     type: z.string().optional(),
     position: z.number().int().optional(),
     required_for_agents: z.boolean().optional(),
+    agents_can_edit: z.boolean().optional(),
+    displayed_for_agents: z.boolean().optional(),
+    quick_add_for_agent: z.boolean().optional(),
+    unique: z.boolean().optional(),
     choices: z.array(FieldChoice).optional(),
   })
   .passthrough();
-export const CompanyFieldCreate = CompanyFieldBase.refine((v) => !!v.label && !!v.type, {
-  message: "label and type are required",
-});
+export const CompanyFieldCreate = CompanyFieldBase.refine(
+  (v) => !!v.label && !!v.type && hasAgentFlags(v),
+  {
+    message:
+      "label, type, agents_can_edit, displayed_for_agents, quick_add_for_agent, unique are required",
+  },
+);
 export const CompanyFieldUpdate = CompanyFieldBase;
 
 // ────────────────────────────────────────────────────────────────────
@@ -666,16 +713,18 @@ const MailboxBase = z
   .object({
     name: z.string().optional(),
     support_email: z.string().email().optional(),
-    forward_email: z.string().email().optional(),
+
     group_id: z.number().int().optional(),
     product_id: z.number().int().optional(),
-    mailbox_type: z.string().optional(),
-    active: z.boolean().optional(),
-    default_reply_email: z.boolean().optional(),
+    mailbox_type: z.enum(["freshdesk_mailbox", "custom_mailbox"]).optional(),
+    default_reply_email: z.union([z.boolean(), z.string()]).optional(),
+    custom_mailbox: z.record(z.any()).optional(),
   })
   .passthrough();
-export const MailboxCreate = MailboxBase.refine((v) => !!v.name && !!v.support_email, {
-  message: "name and support_email are required",
+export const MailboxCreate = MailboxBase.refine((v) => !!v.support_email && !!v.mailbox_type, {
+  message: "support_email and mailbox_type are required",
+}).refine((v) => v.mailbox_type !== "custom_mailbox" || !!v.custom_mailbox, {
+  message: "custom_mailbox settings are required when mailbox_type is 'custom_mailbox'",
 });
 export const MailboxUpdate = MailboxBase;
 
@@ -690,7 +739,7 @@ export const AutomationRuleCreate = z
     active: z.boolean().optional(),
     performer: z.record(z.any()).optional(),
     events: z.array(z.record(z.any())).optional(),
-    conditions: z.record(z.any()).optional(),
+    conditions: z.union([z.array(z.record(z.any())), z.record(z.any())]).optional(),
     actions: z.array(z.record(z.any())).optional(),
     operator: z.string().optional(),
     summary: z.string().optional(),
@@ -715,37 +764,21 @@ export const CustomObjectRecordUpdate = z
   .passthrough();
 
 // ────────────────────────────────────────────────────────────────────
-// FSM / Threads / Outbound
+// Threads / Outbound
 // ────────────────────────────────────────────────────────────────────
-
-const ServiceTaskBase = z
-  .object({
-    title: z.string().optional(),
-    description: z.string().optional(),
-    status_id: z.number().int().optional(),
-    service_group_id: z.number().int().optional(),
-    assigned_field_technician_id: z.number().int().optional(),
-    scheduled_start_time: z.string().optional(),
-    scheduled_end_time: z.string().optional(),
-    service_location: z.record(z.any()).optional(),
-    custom_fields: CustomFields.optional(),
-  })
-  .passthrough();
-export const ServiceTaskCreate = ServiceTaskBase.refine((v) => !!v.title, {
-  message: "title is required",
-});
-export const ServiceTaskUpdate = ServiceTaskBase;
 
 const ThreadBase = z
   .object({
     type: z.enum(["forward", "discussion", "private"]).optional(),
     title: z.string().optional(),
-    parent_id: z.number().int().optional(),
-    parent_type: z.string().optional(),
+    parent: z
+      .object({ id: z.union([z.string(), z.number()]), type: z.string() })
+      .passthrough()
+      .optional(),
     participants: z
       .object({
-        agents: z.array(z.number().int()).optional(),
-        teams: z.array(z.number().int()).optional(),
+        emails: z.array(z.string()).optional(),
+        agents: z.array(z.union([z.string(), z.number()])).optional(),
       })
       .passthrough()
       .optional(),
@@ -758,14 +791,16 @@ export const ThreadUpdate = ThreadBase;
 const ThreadMessageBase = z
   .object({
     body: z.string().optional(),
-    thread_id: z.number().int().optional(),
+    thread_id: z.union([z.string(), z.number()]).optional(),
     body_text: z.string().optional(),
-    attachment_ids: z.array(z.number().int()).optional(),
+    participants: z.record(z.any()).optional(),
+    additional_info: z.record(z.any()).optional(),
+    attachment_ids: z.array(z.union([z.string(), z.number()])).optional(),
   })
   .passthrough();
 export const ThreadMessageCreate = ThreadMessageBase.refine((v) => !!v.body || !!v.body_text, {
   message: "body or body_text required",
-});
+}).refine((v) => v.thread_id !== undefined, { message: "thread_id is required" });
 export const ThreadMessageUpdate = ThreadMessageBase;
 
 export const OutboundEmailCreate = z
@@ -778,8 +813,9 @@ export const OutboundEmailCreate = z
     priority: TicketPriorityEnum.optional(),
     type: z.string().optional(),
     group_id: z.number().int().optional(),
-    responder_id: z.number().int().optional(),
     tags: z.array(z.string()).optional(),
     custom_fields: CustomFields.optional(),
+    due_by: z.string().optional(),
+    fr_due_by: z.string().optional(),
   })
   .passthrough();

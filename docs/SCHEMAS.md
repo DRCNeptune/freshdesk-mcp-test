@@ -170,9 +170,8 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 | status * | number | Status of the ticket (see `TicketStatusEnum`). Default: `2` (Open). |
 | priority * | number | Priority of the ticket (see `TicketPriorityEnum`). Default: `1` (Low). |
 | description | string | HTML content of the ticket. |
-| description_text | string | Plain-text content of the ticket. |
 | responder_id | number | ID of the agent to whom the ticket has been assigned. |
-| attachments | array of objects | Ticket attachments. Total size cannot exceed **20 MB**. |
+| attachments | array of objects | Ticket attachments (multipart upload — not supported by this server). |
 | cc_emails | array of strings | Email addresses added in the 'cc' field of the incoming ticket email. |
 | custom_fields | dictionary | Key/value pairs containing the names and values of custom fields. |
 | due_by | datetime | Response will be `null` unless provided. Auto-computed within seconds of creation. |
@@ -180,6 +179,7 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 | fr_due_by | datetime | First-response due timestamp. Same null/auto behaviour as `due_by`. |
 | group_id | number | ID of the group to which the ticket has been assigned. Defaults to the group associated with the given `email_config_id`. |
 | parent_id | number | ID of the parent ticket. Setting this converts the current ticket into a child. |
+| related_ticket_ids | array of numbers | Create the ticket as a **tracker** linked to these tickets (create only). |
 | product_id | number | ID of the product the ticket is associated with. Ignored if `email_config_id` is set. |
 | source * | number | Channel through which the ticket was created (see `TicketSourceEnum`). Default: `2` (Portal). |
 | tags | array of strings | Tags associated with the ticket. |
@@ -191,7 +191,7 @@ Numeric Freshdesk enums modeled as Zod literal unions (exhaustive checks).
 **Refinements (enforced locally before HTTP):**
 
 1. Must provide **one of**: `email`, `requester_id`, `facebook_id`, `phone`, `twitter_id`, `unique_external_id`.
-2. Must provide **at least one of**: `subject`, `description`, `description_text`.
+2. Must provide **at least one of**: `subject`, `description`.
 
 ### Update a Ticket — `TicketUpdate`
 
@@ -219,7 +219,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 
 ### Merge Tickets — `TicketMerge`
 
-`PUT /api/v2/tickets/merge` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#merge_tickets)
+`PUT /api/v2/tickets/merge` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#ticket_merge)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -231,7 +231,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 
 ### Forward a Ticket — `TicketForward`
 
-`POST /api/v2/tickets/[id]/forward` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#forward_a_ticket)
+`POST /api/v2/tickets/[id]/forward` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#forward_tickets)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -249,7 +249,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 
 ### Create a Reply — `ReplyCreate`
 
-`POST /api/v2/tickets/[id]/reply` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_reply)
+`POST /api/v2/tickets/[id]/reply` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#reply_ticket)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -259,9 +259,20 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 | cc_emails | array of strings | CC recipients of the reply. |
 | bcc_emails | array of strings | BCC recipients of the reply. |
 
+### Reply to Forward — `ReplyToForwardCreate`
+
+`POST /api/v2/tickets/[id]/reply_to_forward` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#reply_to_forward)
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| body * | string | HTML content of the reply. |
+| to_emails * | array of strings | Third-party recipients (≥1). |
+| body_text | string | Plain-text content. |
+| user_id | number | ID of the agent replying. |
+
 ### Create a Note — `NoteCreate`
 
-`POST /api/v2/tickets/[id]/notes` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_note)
+`POST /api/v2/tickets/[id]/notes` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#add_note_to_a_ticket)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -273,7 +284,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 
 ### Update a Conversation — `ConversationUpdate`
 
-`PUT /api/v2/conversations/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_a_conversation)
+`PUT /api/v2/conversations/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_conversation)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -285,7 +296,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 
 ### Create / Update Ticket Field — `TicketFieldCreate` / `TicketFieldUpdate`
 
-`POST /api/v2/admin/ticket_fields` · `PUT /api/v2/admin/ticket_fields/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#ticket_fields)
+`POST /api/v2/admin/ticket_fields` · `PUT /api/v2/admin/ticket_fields/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_ticket_field)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -314,6 +325,8 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 |-----------|------|-------------|
 | name * | string | Name of the contact. |
 | email † | string | Primary email address. |
+| other_emails | array of strings | Additional emails of the contact. |
+| social_handler † | array of objects | Up to 10 Facebook / Instagram / X handles. |
 | phone † | string | Telephone number. |
 | mobile † | string | Mobile number. |
 | twitter_id † | string | Twitter handle. |
@@ -331,7 +344,7 @@ Same shape as `TicketCreate`; **all fields optional**, refinements removed (Fres
 | custom_fields | dictionary | Custom contact fields. |
 | avatar | file | Profile image (multipart upload only — JSON callers should omit). |
 
-**Refinements:** `name` required; **at least one of** `email`, `phone`, `mobile`, `twitter_id`, `unique_external_id`.
+**Refinements:** `name` required; **at least one of** `email`, `phone`, `mobile`, `twitter_id`, `unique_external_id`, `social_handler`.
 
 ### Update a Contact — `ContactUpdate`
 
@@ -341,7 +354,7 @@ Same shape, all fields optional, no refinements.
 
 ### Merge Contacts — `ContactsMerge`
 
-`POST /api/v2/contacts/merge` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#merge_contacts)
+`POST /api/v2/contacts/merge` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#merge_contact)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -383,7 +396,13 @@ Same shape, all fields optional, no refinements.
 | customers_can_edit | boolean | Whether customers can edit in the portal. Default: `false`. |
 | required_for_customers | boolean | Mandatory in the customer portal. Default: `false`. |
 | displayed_for_customers | boolean | Whether visible in the customer portal. Default: `false`. |
+| agents_can_edit * | boolean | Whether agents can edit the field. |
+| displayed_for_agents * | boolean | Whether the field is shown to agents. |
+| quick_add_for_agent * | boolean | Show in the agent quick-add form. |
+| unique * | boolean | Values must be unique across records. |
 | choices | array | Choices for `custom_dropdown` — each `{ value, position? }`. |
+
+`*` fields are required on create (`ContactFieldCreate`); all fields are optional on update.
 
 ---
 
@@ -424,11 +443,16 @@ Same shape; all fields optional.
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | label * | string | Display name. |
-| label_for_customers | string | Display name visible to customers. |
 | type * | string | Field type — same vocabulary as contact fields. |
 | position | integer | Display position. |
 | required_for_agents | boolean | Mandatory for agents. |
+| agents_can_edit * | boolean | Whether agents can edit the field. |
+| displayed_for_agents * | boolean | Whether the field is shown to agents. |
+| quick_add_for_agent * | boolean | Show in the agent quick-add form. |
+| unique * | boolean | Values must be unique across records. |
 | choices | array | Choices for dropdown / multi-select. |
+
+`*` fields are required on create (`CompanyFieldCreate`); all fields are optional on update.
 
 ---
 
@@ -483,7 +507,7 @@ Same shape, all fields optional.
 
 ### Update a Group — `GroupUpdate`
 
-`PUT /api/v2/groups/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_a_group)
+`PUT /api/v2/groups/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_group)
 
 Same shape; all fields optional.
 
@@ -495,15 +519,15 @@ Admin Groups (SLA-aware variants) use the same schema against `/api/v2/admin/gro
 
 ### Create / Update Skill — `SkillCreate` / `SkillUpdate`
 
-`POST /api/v2/admin/skills` · `PUT /api/v2/admin/skills/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#skills)
+`POST /api/v2/admin/skills` · `PUT /api/v2/admin/skills/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_skill)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | name * | string | Name of the skill. |
 | rank | integer | Priority rank — Freshdesk evaluates skills in ascending rank order. |
-| agent_ids | array of integers | IDs of agents possessing this skill. |
-| condition_match_type | string | `"all"` = match every condition (AND); `"any"` = match any (OR). |
-| conditions | array of objects | Condition definitions used to auto-assign tickets matching this skill. |
+| agents | array of objects | Agents possessing this skill: `[{ "id": 123 }]`. |
+| match_type | string | `"all"` = match every condition (AND); `"any"` = match any (OR). |
+| conditions | array of objects | `{ resource_type: "ticket"\|"contact"\|"company", field_name, operator: "in"\|"not_in"\|"is"\|"is_not", value[] }`. |
 
 ---
 
@@ -588,7 +612,7 @@ Update variants (`SolutionCategoryUpdate` / `SolutionFolderUpdate` / `SolutionAr
 
 ### Create a Forum Category — `ForumCategoryCreate`
 
-`POST /api/v2/discussions/categories` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_category)
+`POST /api/v2/discussions/categories` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_category)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -597,36 +621,38 @@ Update variants (`SolutionCategoryUpdate` / `SolutionFolderUpdate` / `SolutionAr
 
 ### Create a Forum — `ForumCreate`
 
-`POST /api/v2/discussions/categories/[category_id]/forums` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_forum)
+`POST /api/v2/discussions/categories/[category_id]/forums` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_forum)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | name * | string | Name of the forum. |
 | description | string | Description of the forum. |
 | forum_type * | integer | `1` = Howto, `2` = Ideas, `3` = Problems, `4` = Announcements. |
-| forum_visibility | integer | `1` = All, `2` = Logged-in users, `3` = Agents only, `4` = Selected companies. |
-| customer_ids | array of integers | Required when `forum_visibility = 4`. |
+| forum_visibility * | integer | `1` = All, `2` = Logged-in users, `3` = Agents only, `4` = Selected companies. |
+| company_ids | array of integers | Companies that can see the forum when `forum_visibility = 4`. |
+| forum_category_id | integer | Update only: move the forum to another category. |
 
 ### Create a Topic — `TopicCreate`
 
-`POST /api/v2/discussions/forums/[forum_id]/topics` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_topic)
+`POST /api/v2/discussions/forums/[forum_id]/topics` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_topic)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | title * | string | Title of the topic. |
-| message_html * | string | HTML body of the first post. |
+| message * | string | HTML body of the first post. |
+| forum_id | integer | Update only: move the topic to another forum. |
 | sticky | boolean | Pin the topic to the top of the forum. |
 | locked | boolean | Lock the topic against new replies. |
 | stamp_type | integer | Stamp / status integer (forum-type specific, e.g. "Planned", "Implemented", "Already exists"). |
 
 ### Create a Comment — `CommentCreate`
 
-`POST /api/v2/discussions/topics/[topic_id]/comments` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_comment)
+`POST /api/v2/discussions/topics/[topic_id]/comments` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_comment)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| body_html * | string | HTML content of the comment. |
-| answer | boolean | Mark this comment as the accepted answer. |
+| body * | string | HTML content of the comment. |
+| answer | boolean | Update only: mark this comment as the accepted answer. |
 
 Update variants share the same shape, fields optional.
 
@@ -636,7 +662,7 @@ Update variants share the same shape, fields optional.
 
 ### Create a Satisfaction Rating — `SatisfactionRatingCreate`
 
-`POST /api/v2/tickets/[ticket_id]/satisfaction_ratings` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_satisfaction_rating)
+`POST /api/v2/tickets/[ticket_id]/satisfaction_ratings` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_satisfaction_rating)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -649,7 +675,7 @@ Update variants share the same shape, fields optional.
 
 ### Create a Time Entry — `TimeEntryCreate`
 
-`POST /api/v2/tickets/[ticket_id]/time_entries` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_time_entry)
+`POST /api/v2/tickets/[ticket_id]/time_entries` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_time_entry)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -663,7 +689,7 @@ Update variants share the same shape, fields optional.
 
 ### Update a Time Entry — `TimeEntryUpdate`
 
-`PUT /api/v2/time_entries/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_a_time_entry)
+`PUT /api/v2/time_entries/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#update_time_entry)
 
 Same shape, fields optional.
 
@@ -681,7 +707,7 @@ These resources are **read-only** (list / view); no create schema is exposed by 
 - `list_business_hours`, `view_business_hours` → `/api/v2/business_hours`
 - `list_products`, `view_product` → `/api/v2/products`
 
-See [Freshdesk docs ↗](https://developers.freshdesk.com/api/#sla_policies).
+See [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_sla_policy).
 
 ---
 
@@ -689,18 +715,17 @@ See [Freshdesk docs ↗](https://developers.freshdesk.com/api/#sla_policies).
 
 ### Create / Update Mailbox — `MailboxCreate` / `MailboxUpdate`
 
-`POST /api/v2/email/mailboxes` · `PUT /api/v2/email/mailboxes/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_mailbox)
+`POST /api/v2/email/mailboxes` · `PUT /api/v2/email/mailboxes/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_email_mailbox)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| name * | string | Mailbox name shown in Freshdesk. |
+| name | string | Mailbox name shown in Freshdesk. |
 | support_email * | string | The address customers email (e.g. `support@yourcompany.com`). |
-| forward_email | string | The address customer email is forwarded to (Freshdesk-provided). |
+| mailbox_type * | string enum | `"freshdesk_mailbox"` or `"custom_mailbox"`. |
 | group_id | integer | Default group for tickets received here. |
 | product_id | integer | Product associated with the mailbox. |
-| mailbox_type | string | Implementation kind, e.g. `"forward_email"`, `"custom_mailbox"`. |
-| active | boolean | Whether the mailbox is enabled. |
 | default_reply_email | boolean | Whether replies use this address as default. |
+| custom_mailbox | object | Required for `custom_mailbox`: `{ access_type: "incoming"\|"outgoing"\|"both", incoming: { mail_server, port, use_ssl, authentication, username, password }, outgoing: { … } }`. |
 
 ---
 
@@ -731,7 +756,7 @@ Rule-type id values: `1` = ticket-creation, `3` = time-triggered, `4` = ticket-u
 
 ### Create / Update Custom Object Record — `CustomObjectRecordCreate` / `CustomObjectRecordUpdate`
 
-`POST /api/v2/custom_objects/schemas/[schema_id]/records` · `PUT /api/v2/custom_objects/schemas/[schema_id]/records/[record_id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_record)
+`POST /api/v2/custom_objects/schemas/[schema_id]/records` · `PUT /api/v2/custom_objects/schemas/[schema_id]/records/[record_id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_new_custom_object_record)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -743,21 +768,7 @@ Schema fields are entirely defined by the user-created custom object; this MCP s
 
 ## Field Service Management
 
-### Create / Update Service Task — `ServiceTaskCreate` / `ServiceTaskUpdate`
-
-`POST /api/v2/tickets/[ticket_id]/fsm/service_tasks` · `PUT /api/v2/fsm/service_tasks/[id]` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_service_task)
-
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| title * | string | Task title. |
-| description | string | Task description. |
-| status_id | integer | Status ID (account-defined). |
-| service_group_id | integer | Service group assignment. |
-| assigned_field_technician_id | integer | ID of the field technician. |
-| scheduled_start_time | datetime | Scheduled start. |
-| scheduled_end_time | datetime | Scheduled end. |
-| service_location | object | Address / coordinates payload. |
-| custom_fields | dictionary | Custom service-task fields. |
+Service tasks are ordinary tickets with `type: "Service Task"` ([Freshdesk docs ↗](https://developers.freshdesk.com/api/#service_task)). `create_service_task` / `update_service_task` send a ticket payload to `POST /api/v2/tickets` / `PUT /api/v2/tickets/[id]`; required custom fields on create: `cf_fsm_contact_name`, `cf_fsm_phone_number`, `cf_fsm_service_location` (optional `cf_fsm_appointment_start_time`, `cf_fsm_appointment_end_time`). Pass `parent_id` to attach the task to a ticket (max 10 per parent).
 
 ---
 
@@ -771,21 +782,22 @@ Schema fields are entirely defined by the user-created custom object; this MCP s
 |-----------|------|-------------|
 | type * | string enum | `"forward"`, `"discussion"`, or `"private"`. |
 | title | string | Title of the thread. |
-| parent_id | number | ID of the parent entity (usually a ticket). |
-| parent_type | string | Parent type, e.g. `"Ticket"`. |
-| participants | object | `{ agents?: int[], teams?: int[] }`. |
+| parent | object | `{ id: "<ticket id>", type: "ticket" }`. |
+| participants | object | `{ emails?: string[], agents?: (string\|number)[] }`. |
 | additional_info | dictionary | Free-form metadata. |
 
 ### Create a Thread Message — `ThreadMessageCreate`
 
-`POST /api/v2/collaboration/threads/[thread_id]/messages` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_a_message)
+`POST /api/v2/collaboration/messages` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_message_for_thread)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | body † | string | HTML message body. One of `body` / `body_text` required. |
 | body_text † | string | Plain-text message body. |
-| thread_id | number | Thread ID (auto-populated from URL on POST). |
-| attachment_ids | array of integers | Attachments to associate. |
+| thread_id * | string | Thread ID (filled from the tool's `thread_id` arg). |
+| participants | object | `{ email: { to: string[], cc?: string[], bcc?: string[] } }`. |
+| additional_info | object | e.g. `{ has_quoted_text: true, email_subject: "Fwd: …" }`. |
+| attachment_ids | array | Attachments to associate. |
 
 ---
 
@@ -793,7 +805,7 @@ Schema fields are entirely defined by the user-created custom object; this MCP s
 
 ### Create an Outbound Email — `OutboundEmailCreate`
 
-`POST /api/v2/tickets/outbound_email` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_an_outbound_email)
+`POST /api/v2/tickets/outbound_email` · [Freshdesk docs ↗](https://developers.freshdesk.com/api/#create_outbound_email)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -821,7 +833,8 @@ Schema fields are entirely defined by the user-created custom object; this MCP s
 | `TicketBulkDeleteAction`          | `bulk_delete_tickets`                                                                    |
 | `TicketMerge`                     | `merge_tickets`                                                                          |
 | `TicketForward`                   | `forward_ticket`                                                                         |
-| `ReplyCreate`                     | `create_ticket_reply`, `reply_to_forward`                                                |
+| `ReplyCreate`                     | `create_ticket_reply`                                                                    |
+| `ReplyToForwardCreate`            | `reply_to_forward`                                                                       |
 | `NoteCreate`                      | `create_ticket_note`                                                                     |
 | `ConversationUpdate`              | `update_ticket_conversation`                                                             |
 | `TicketFieldCreate/Update`        | `create_ticket_field`, `update_ticket_field`                                             |
@@ -849,7 +862,6 @@ Schema fields are entirely defined by the user-created custom object; this MCP s
 | `MailboxCreate/Update`            | `create_email_mailbox`, `update_email_mailbox`                                           |
 | `AutomationRuleCreate/Update`     | `create_automation_rule`, `update_automation_rule`                                       |
 | `CustomObjectRecordCreate/Update` | `create_custom_object_record`, `update_custom_object_record`                             |
-| `ServiceTaskCreate/Update`        | `create_service_task`, `update_service_task`                                             |
 | `ThreadCreate/Update`             | `create_thread`, `update_thread`                                                         |
 | `ThreadMessageCreate/Update`      | `create_thread_message`, `update_thread_message`                                         |
 | `OutboundEmailCreate`             | `create_outbound_email`                                                                  |

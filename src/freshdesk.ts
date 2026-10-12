@@ -3,6 +3,11 @@ const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
 
 if (!FRESHDESK_API_KEY || !FRESHDESK_DOMAIN) {
   console.error("[freshdesk-mcp] FRESHDESK_API_KEY and FRESHDESK_DOMAIN env vars are required");
+} else if (!/\.freshdesk\.com$/i.test(FRESHDESK_DOMAIN)) {
+  // The v2 API only answers on <account>.freshdesk.com, not on custom CNAMEs.
+  console.error(
+    `[freshdesk-mcp] FRESHDESK_DOMAIN should be your <account>.freshdesk.com host (got '${FRESHDESK_DOMAIN}'); custom domains are not supported by the API`,
+  );
 }
 
 const authHeader = `Basic ${Buffer.from(`${FRESHDESK_API_KEY}:X`).toString("base64")}`;
@@ -73,12 +78,34 @@ export const fd = {
   get: <T = any>(path: string, query?: Record<string, any>) => request<T>("GET", path, { query }),
   post: <T = any>(path: string, body?: any) => request<T>("POST", path, { body }),
   put: <T = any>(path: string, body?: any) => request<T>("PUT", path, { body }),
+  patch: <T = any>(path: string, body?: any) => request<T>("PATCH", path, { body }),
   delete: <T = any>(path: string) => request<T>("DELETE", path),
 };
+
+type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+/**
+ * A few endpoints have a different verb in the docs header vs. the curl sample.
+ * Try each method in order, moving on only when the route itself is rejected (404/405).
+ */
+export async function requestFirstOf<T = any>(methods: Method[], path: string, body?: any) {
+  let res!: FreshdeskResult<T>;
+  for (const m of methods) {
+    res = await request<T>(m, path, { body });
+    if (res.status !== 404 && res.status !== 405) break;
+  }
+  return res;
+}
 
 export function errorPayload(prefix: string, res: FreshdeskResult) {
   return {
     error: `${prefix}: HTTP ${res.status}`,
     details: res.data,
+    ...(res.status === 429
+      ? {
+          hint: "Rate limited by Freshdesk; wait retry_after_seconds before retrying.",
+          retry_after_seconds: Number(res.headers.get("retry-after")) || undefined,
+        }
+      : {}),
   };
 }

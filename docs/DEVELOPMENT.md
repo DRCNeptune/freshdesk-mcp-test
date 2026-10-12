@@ -59,18 +59,22 @@ npm run build
 ### Tool registration helper: `src/util.ts`
 
 ```ts
-export function tool<S extends Record<string, any>>(
+export function tool<S extends ZodRawShape>(
   server: McpServer,
   name: string,
   description: string,
   inputSchema: S,
-  cb: ToolCallback<S>,
+  cb: (args: z.objectOutputType<S, ZodTypeAny>) => ToolResult | Promise<ToolResult>,
 ) {
-  return server.registerTool(name, { description, inputSchema }, cb);
+  return server.registerTool(name, { description, inputSchema } as any, cb as any);
 }
 ```
 
-Plus `text(obj)` (wraps any value into MCP `content[]`) and `validate(schema, data)` (runs `safeParse` and returns either `{ ok: true, data }` or `{ ok: false, reply: text({error, issues}) }`).
+Args are typed with zod v3's `objectOutputType` on purpose: the SDK's own `ToolCallback` goes through its zod v3/v4 compat conditional types, which made `tsc` run out of memory with ~240 tools. `prompts.ts` uses the same trick for `registerPrompt`.
+
+Write descriptions for the model, not for humans skimming code: say what the tool does, when to use it vs. its siblings, the payload's key fields/enums, and gotchas (irreversible, async job, list replaced on update…). Put per-field hints in `.describe()`.
+
+Plus `text(obj)` (wraps any value into MCP `content[]`, setting `isError: true` when the payload has a top-level `error`), `pageArgs`, `langArg`/`lang()` and `validate(schema, data)` (runs `safeParse` and returns either `{ ok: true, data }` or `{ ok: false, reply: text({error, issues}) }`).
 
 ### Freshdesk client: `src/freshdesk.ts`
 
@@ -169,7 +173,7 @@ FRESHDESK_API_KEY=test FRESHDESK_DOMAIN=example.freshdesk.com node dist/index.js
 
 ### 5. Document
 
-- Add the entries to [docs/API.md](API.md) under the appropriate section.
+- Regenerate [docs/API.md](API.md): `npm run build && npm run docs:api`. New section? Add it to `SECTIONS` in `scripts/gen-api-docs.mjs`; add the upstream anchor to `anchors` there.
 - Document the schema in [docs/SCHEMAS.md](SCHEMAS.md).
 - Add a line to [CHANGELOG.md](../CHANGELOG.md) under "Unreleased".
 
@@ -239,6 +243,7 @@ Pass intentionally bad input and confirm Zod rejects it before any HTTP call:
 ## Build & Type-Check
 
 - `npm run build` — single `tsc` pass. Output to `dist/`.
+- `npm test` — build, then `node --test test/*.test.mjs` (conversation pagination, attachment SSRF guard, image parsing). Tests mock `fetch`; no Freshdesk account needed.
 - The codebase ships with `strict: true`, `forceConsistentCasingInFileNames: true`, and source maps enabled.
 - There should be **zero** `error` and **zero** `deprecation hint` diagnostics on a clean build. If you see deprecation hints, you're using an older SDK method — switch to `registerTool` / `registerPrompt`.
 

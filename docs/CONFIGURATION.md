@@ -13,6 +13,8 @@ All configuration is via environment variables (read at process start) plus an o
 | `MCP_TRANSPORT`      | no       | `stdio` | `stdio`, `http`                  | Which MCP transport to expose.                                                                           |
 | `PORT`               | no       | `3000`  | int 1–65535                      | HTTP listen port. Only used when `MCP_TRANSPORT=http`.                                                   |
 | `NODE_ENV`           | no       | unset   | `production`, `development`, ... | Standard Node convention. Only affects defaults in some downstream libs.                                 |
+| `FRESHDESK_ATTACHMENT_HOSTS` | no | `freshdesk.com,freshworks.com,freshdeskusercontent.com,amazonaws.com` | comma-separated host suffixes | Hosts `get_ticket_attachment` / `get_ticket_inline_images` may download from (HTTPS only, re-checked on every redirect). Inline `<img src>` URLs are customer-controlled, so keep this list tight. |
+| `FRESHDESK_MAX_ATTACHMENT_BYTES` | no | `5242880` (5 MB) | int | Per-file download cap for attachment tools; the per-call total is 4× this. |
 
 A boot warning is emitted to `stderr` if `FRESHDESK_API_KEY` or `FRESHDESK_DOMAIN` is missing. The server still starts so MCP tool discovery works, but every Freshdesk call will fail.
 

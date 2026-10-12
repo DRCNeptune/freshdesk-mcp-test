@@ -11,7 +11,7 @@
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg" alt="Node"></a>
   <a href="https://www.typescriptlang.org/"><img src="https://img.shields.io/badge/TypeScript-5.7-blue.svg" alt="TypeScript"></a>
   <a href="https://github.com/modelcontextprotocol/typescript-sdk"><img src="https://img.shields.io/badge/MCP%20SDK-1.29-purple.svg" alt="MCP SDK"></a>
-  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-194-orange.svg" alt="Tools"></a>
+  <a href="docs/API.md"><img src="https://img.shields.io/badge/tools-255-orange.svg" alt="Tools"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
 </p>
 
@@ -48,7 +48,7 @@
 
 | | |
 |---|---|
-| **194 tools** | Tickets, Conversations, Contacts, Agents, Skills, Roles, Groups, Companies, Discussions, Solutions, Surveys, FSM, Time Entries, Email Configs, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Messages, and more |
+| **255 tools** | Tickets, Conversations, Attachments & inline images, Ticket Forms, Contacts, Agents, Availability, Skills, Roles, Groups, Companies, Discussions, Solutions, CSAT Surveys, FSM, Time Entries, Email Configs & Settings, Products, Business Hours, SLA, Automations, Custom Objects, Canned Responses, Outbound Email & WhatsApp, and more |
 | **2 prompts** | `create_ticket`, `create_reply` |
 | **Strict Zod validation** | Derived from official Freshdesk docs — invalid input is rejected before hitting the API, with structured `{path, code, message}` errors |
 | **Dual transport** | `stdio` for local clients (Claude Desktop, Cursor) or `Streamable HTTP` for hosted/remote agents |
@@ -324,19 +324,23 @@ Sessions begin with `POST /mcp` containing an `initialize` body; the server retu
 
 | Group | Tools | Highlights |
 |---|---|---|
-| Tickets | 30 | CRUD, bulk_*, restore, archived, merge, forward, summary, satisfaction, time entries |
-| Conversations | 6 | Reply, note, update, delete, reply_to_forward |
-| Contacts | 17 | CRUD, merge, make_agent, restore, hard_delete, invite, contact fields CRUD |
-| Companies | 13 | CRUD, search, company contacts, company fields CRUD |
-| Agents + Groups | 18 | Agents CRUD + `me` + bulk; Groups CRUD; Admin-Groups CRUD |
-| Solutions | 16 | Categories / folders / articles CRUD + search |
-| Discussions | 19 | Forum categories / forums / topics / comments CRUD |
-| Time Entries | 6 | CRUD + toggle timer |
-| Threads | 9 | Collaboration threads + messages CRUD |
-| Automations | 5 | Rules CRUD per type |
-| FSM | 8 | Service tasks, appointments, business calendars |
-| Custom Objects | 7 | Schemas + records CRUD |
-| ...and more | — | Skills, Roles, Products, Business Hours, SLA, Email Configs, Mailboxes, Settings, Account, Jobs, Surveys, Satisfaction Ratings, Outbound, Availability, Omnichannel |
+| Tickets | 33 | CRUD, search (query language), restore, bulk create/update/delete, merge, archived, summary, watchers, parent/child & tracker associations, portal user access |
+| Conversations & Attachments | 10 | Reply, note, forward, reply_to_forward, update/delete; full-thread pagination; read attachments and inline screenshots |
+| Ticket Fields, Sections & Forms | 19 | Field CRUD, dynamic sections, portal ticket forms (+ clone) |
+| Contacts | 23 | CRUD, filter, merge, make_agent, restore, hard_delete, invite, export/import, contact fields |
+| Companies | 18 | CRUD, autocomplete, filter, contacts, export/import, company fields |
+| Agents & Groups | 23 | Agents CRUD + `me` + bulk, availability/load settings, groups, admin groups, group membership |
+| Canned Responses | 11 | Folders + responses CRUD, bulk create |
+| Solutions | 18 | Categories / folders / subfolders / articles, search, translations |
+| Discussions | 24 | Forum categories / forums / topics / comments CRUD, follow/monitor |
+| Surveys & CSAT | 7 | New CSAT surveys + responses, classic satisfaction ratings |
+| Automations & Scenarios | 8 | Rules CRUD per type, scenario automations |
+| Custom Objects | 8 | Schemas, records CRUD, filter, count |
+| FSM | 5 | Service tasks (tickets of type `Service Task`) |
+| Outbound | 3 | Outbound email, proactive WhatsApp templates + status |
+| Threads | 9 | Collaboration threads + messages |
+| Time Entries | 5 | CRUD + toggle timer |
+| Admin & misc | 31 | Skills, roles, products, business hours, SLA, email configs, mailboxes, email settings, auto-BCC, helpdesk settings, account + export, jobs, contact activities |
 
 Zod schema reference: **[docs/SCHEMAS.md](docs/SCHEMAS.md)**
 
@@ -355,17 +359,18 @@ freshdesk-mcp/
 │   ├── schemas/
 │   │   └── index.ts          # Zod schemas for every Freshdesk resource
 │   └── tools/
-│       ├── tickets.ts        # Tickets + conversations + ticket fields
+│       ├── tickets.ts        # Tickets, conversations, ticket fields/sections/forms
+│       ├── attachments.ts    # Attachment + inline image download (SSRF-guarded)
 │       ├── contacts.ts       # Contacts + contact fields
 │       ├── companies.ts      # Companies + company fields
-│       ├── agents.ts         # Agents + groups + admin-groups
+│       ├── agents.ts         # Agents, availability, groups, admin-groups
 │       ├── canned.ts         # Canned responses + folders
 │       ├── solutions.ts      # Categories / folders / articles
 │       ├── admin_misc.ts     # Skills, roles, products, BH, SLA, mailboxes,
 │       │                     # email configs, settings, account, threads, time entries
 │       └── extras.ts         # Discussions, surveys, automations, scenario,
 │                             # custom objects, FSM, outbound, jobs,
-│                             # availability, omnichannel
+│                             # contact activities
 ├── docs/
 │   ├── API.md                # Full tool reference
 │   ├── SCHEMAS.md            # Zod schema reference

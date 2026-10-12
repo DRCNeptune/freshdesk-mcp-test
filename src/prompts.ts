@@ -1,8 +1,19 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import { type ZodRawShape, type ZodTypeAny, z } from "zod";
+
+// Same reason as util.tool(): bypass the SDK's zod v3/v4 compat types that blow up tsc.
+function prompt<S extends ZodRawShape>(
+  server: McpServer,
+  name: string,
+  config: { description: string; argsSchema: S },
+  cb: (args: z.objectOutputType<S, ZodTypeAny>) => unknown,
+) {
+  server.registerPrompt(name, config as any, cb as any);
+}
 
 export function registerPrompts(server: McpServer) {
-  server.registerPrompt(
+  prompt(
+    server,
     "create_ticket",
     {
       description: "Guide for creating a Freshdesk ticket.",
@@ -39,7 +50,8 @@ export function registerPrompts(server: McpServer) {
     },
   );
 
-  server.registerPrompt(
+  prompt(
+    server,
     "create_reply",
     {
       description: "Guide for creating a Freshdesk ticket reply.",
